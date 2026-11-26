@@ -29,6 +29,7 @@ UNIT_TABLE: dict[str, tuple[str, float, float]] = {
     "sy": ("area", 0.83612736, 0.0),
     "in2": ("area", 0.00064516, 0.0),
     "kcmil": ("area", 5.06707479e-7, 0.0),
+    "mcm": ("area", 5.06707479e-7, 0.0),
     # Volume -> m^3
     "m3": ("volume", 1.0, 0.0),
     "cy": ("volume", 0.764554857984, 0.0),
@@ -36,24 +37,41 @@ UNIT_TABLE: dict[str, tuple[str, float, float]] = {
     "cf": ("volume", 0.028316846592, 0.0),
     "l": ("volume", 1e-3, 0.0),
     "gal": ("volume", 0.003785411784, 0.0),
-    # Electrical
+    # Electrical & Power
     "a": ("current", 1.0, 0.0),
     "ka": ("current", 1000.0, 0.0),
     "v": ("voltage", 1.0, 0.0),
     "kv": ("voltage", 1000.0, 0.0),
+    "va": ("apparent_power", 1.0, 0.0),
+    "kva": ("apparent_power", 1000.0, 0.0),
+    "mva": ("apparent_power", 1e6, 0.0),
     "w": ("power", 1.0, 0.0),
     "kw": ("power", 1000.0, 0.0),
     "mw": ("power", 1e6, 0.0),
+    "hp": ("power", 745.699872, 0.0),
     "btu/hr": ("power", 0.29307107, 0.0),
+    "btuh": ("power", 0.29307107, 0.0),
+    "mbh": ("power", 293.07107, 0.0),
+    "mmbtu/hr": ("power", 293071.07, 0.0),
     "ton_ref": ("power", 3516.85284, 0.0),
+    "tr": ("power", 3516.85284, 0.0),
+    "ton_cooling": ("power", 3516.85284, 0.0),
+    "tons": ("power", 3516.85284, 0.0),
     # Pressure / Stress -> Pa
     "pa": ("pressure", 1.0, 0.0),
     "kpa": ("pressure", 1000.0, 0.0),
     "mpa": ("pressure", 1e6, 0.0),
+    "bar": ("pressure", 1e5, 0.0),
     "psf": ("pressure", 47.88025898, 0.0),
     "ksf": ("pressure", 47880.25898, 0.0),
     "psi": ("pressure", 6894.757293, 0.0),
     "ksi": ("pressure", 6894757.293, 0.0),
+    "in_wg": ("pressure", 249.0889, 0.0),
+    "in_w.g.": ("pressure", 249.0889, 0.0),
+    "in wg": ("pressure", 249.0889, 0.0),
+    "in w.g.": ("pressure", 249.0889, 0.0),
+    "ft_h2o": ("pressure", 2989.067, 0.0),
+    "ft h2o": ("pressure", 2989.067, 0.0),
     # Force -> N
     "n": ("force", 1.0, 0.0),
     "kn": ("force", 1000.0, 0.0),
@@ -63,7 +81,13 @@ UNIT_TABLE: dict[str, tuple[str, float, float]] = {
     # Linear force -> N/m
     "lb/ft": ("linear_force", 14.5939029, 0.0),
     "plf": ("linear_force", 14.5939029, 0.0),
+    "klf": ("linear_force", 14593.9029, 0.0),
+    "kip/ft": ("linear_force", 14593.9029, 0.0),
     "kn/m": ("linear_force", 1000.0, 0.0),
+    # Density -> kg/m^3
+    "kg/m3": ("density", 1.0, 0.0),
+    "pcf": ("density", 16.018463, 0.0),
+    "lb/ft3": ("density", 16.018463, 0.0),
     # Flow -> m^3/s
     "m3/s": ("flow", 1.0, 0.0),
     "l/s": ("flow", 1e-3, 0.0),
@@ -97,10 +121,12 @@ CANONICAL_UNIT = {
     "volume": "m3",
     "current": "A",
     "voltage": "V",
+    "apparent_power": "VA",
     "power": "W",
     "pressure": "Pa",
     "force": "N",
     "linear_force": "N/m",
+    "density": "kg/m3",
     "flow": "m3/s",
     "thermal_res": "K*m/W",
     "temp": "K",
@@ -258,3 +284,47 @@ class EvidenceLedger:
                 for k, v in self.records.items()
             },
         }
+
+    def summary_markdown(self) -> str:
+        """Formats active governing evidence entries and any unresolved conflicts as Markdown."""
+        if not self.records:
+            return "## Evidence Ledger\n\nNo engineering evidence records logged."
+
+        lines = [
+            "## Evidence Ledger",
+            "",
+            "| Key | Value | Normalized (SI) | Source Locator | Revision | Status |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for key in sorted(self.records):
+            bucket = self.records[key]
+            superseded_locs = {r.supersedes for r in bucket if r.supersedes}
+            active = [r for r in bucket if r.source_locator not in superseded_locs] or bucket
+            latest = active[-1]
+            conflicts = self._conflicts_for(key)
+            val_str = f"{latest.value} {latest.unit}".strip().replace("|", "\\|").replace("\n", " ")
+            norm_str = (
+                f"{latest.normalized_value:.6g} {latest.normalized_unit}".strip()
+                if latest.normalized_value is not None
+                else "—"
+            )
+            loc_str = latest.source_locator.replace("|", "\\|").replace("\n", " ")
+            rev_str = (latest.revision or "—").replace("|", "\\|").replace("\n", " ")
+            status_str = f"CONFLICT ({len(conflicts)} active)" if conflicts else "OK"
+            if superseded_locs:
+                status_str += f" ({len(superseded_locs)} superseded)"
+            lines.append(
+                f"| `{key}` | {val_str} | {norm_str} | `{loc_str}` | {rev_str} | {status_str} |"
+            )
+
+        all_conflicts = self.unresolved_conflicts()
+        if all_conflicts:
+            lines.extend(["", "### Unresolved Conflicts", ""])
+            for key in sorted(all_conflicts):
+                entries = ", ".join(
+                    f"{c['value']} {c['unit']} (`{c['source_locator']}`)"
+                    for c in all_conflicts[key]
+                )
+                lines.append(f"- **`{key}`**: {entries}")
+
+        return "\n".join(lines)

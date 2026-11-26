@@ -36,7 +36,9 @@ from mcp_catalog import MCPCatalog, estimate_schema_tokens, tool_schema
 from pricing import UsageTracker
 from verifiers import (
     audit_decision_memo,
+    audit_dxf_bytes,
     audit_ifc4_bytes,
+    audit_pdf_bytes,
     audit_workbook_bytes,
     audit_zip_deliverables,
 )
@@ -99,9 +101,13 @@ CONTEXT_MARGIN = 1024
 RETRY_WAITS = (5, 15, 30, 60, 120)
 MAX_INCUMBENT_BYTES = 20 * 1024 * 1024
 
-AUDIT_EXTENSIONS = (".xlsx", ".xlsm", ".zip", ".ifc", ".docx")
+AUDIT_EXTENSIONS = (".xlsx", ".xlsm", ".zip", ".ifc", ".docx", ".dxf", ".pdf")
 OUTPUT_PATH_RE = re.compile(
-    r"(?:^|[\s\"'(=])(/[^\s\"')<>]+\.(?:xlsx|xlsm|zip|ifc|docx|md|txt|json|pdf|csv))",
+    r"(?:^|[\s\"'(`=])(/[^\s\"')<>`]+\.(?:xlsx|xlsm|zip|ifc|docx|dxf|md|txt|json|pdf|csv))",
+    re.I,
+)
+DELIVERABLE_MENTION_RE = re.compile(
+    r"(?:^|[\s\"'(`=/])([A-Za-z0-9._-]+\.(?:xlsx|xlsm|zip|ifc|docx|dxf|md|txt|json|pdf|csv))(?=$|[\s\"')`.,;:!?])",
     re.I,
 )
 
@@ -114,6 +120,8 @@ Follow a disciplined 5-step engineering workflow:
 3. COMPUTE & DECIDE DETERMINISTICALLY: Write clean Python verification/generation scripts executed via `bash`; check unit conversions, balances, geometry/clearances, and schedules numerically rather than by hand.
 4. PRODUCE REAL DELIVERABLES EARLY: Write exact requested formats (XLSX, DOCX, IFC4 STEP, PDF, Markdown) at exact requested paths and perform required task-local MCP actions with read-back verification. Use save_incumbent once a deliverable passes audit.
 5. COLD-READ VERIFY BEFORE FINISHING: Run `run_export_audit` (or Python readback checks) on saved bytes to verify workbook formulas/rollups/narrative reconciliation, IFC clashes/connectivity, or decision-memo prerequisite consistency.
+
+CRITICAL SEQUENTIAL RULE: NEVER guess or predict an external MCP output, file read, or calculation result in parallel with writing a file — always call the read/MCP/calculation tool first, wait for the returned observation, and then call `write_file` or `edit_file` on the following turn with the verified result.
 
 Time budget: about {minutes} minutes remaining (live updates follow tool results). When all requested artifacts and verifications are verified complete, answer without tool calls summarizing exact deliverable paths and traced results."""
 
@@ -131,6 +139,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     """Configuration parsed from container environment variables."""
@@ -144,11 +160,13 @@ class RuntimeConfig:
     reserve_verify_sec: int
     budget_cap_usd: float
     mcp_discovery_mode: str
+    mcp_direct_max_tools: int
     enable_evidence_ledger: bool
     enable_export_verifier: bool
     enable_incumbent_retention: bool
     enable_image_input: bool
     max_verify_repairs: int
+    max_model_calls: int = 0
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -166,11 +184,13 @@ class RuntimeConfig:
             reserve_verify_sec=int(os.environ.get("RESERVE_VERIFY_SEC", "150")),
             budget_cap_usd=float(os.environ.get("BUDGET_CAP_USD", "0") or "0"),
             mcp_discovery_mode=os.environ.get("MCP_DISCOVERY_MODE", "ondemand").strip().lower(),
+            mcp_direct_max_tools=max(0, int(os.environ.get("MCP_DIRECT_MAX_TOOLS", "8") or "8")),
             enable_evidence_ledger=_env_bool("ENABLE_EVIDENCE_LEDGER", True),
             enable_export_verifier=_env_bool("ENABLE_EXPORT_VERIFIER", True),
             enable_incumbent_retention=_env_bool("ENABLE_INCUMBENT_RETENTION", True),
             enable_image_input=_env_bool("ENABLE_IMAGE_INPUT", False),
             max_verify_repairs=max(0, int(os.environ.get("MAX_VERIFY_REPAIRS", "2"))),
+            max_model_calls=max(0, int(os.environ.get("MAX_MODEL_CALLS", "0") or "0")),
         )
 
 
@@ -242,10 +262,10 @@ def build_base_tools(config: RuntimeConfig) -> list[dict[str, Any]]:
         tools.append(
             tool_schema(
                 "run_export_audit",
-                "Open exported deliverable bytes (XLSX, ZIP, IFC4 STEP, DOCX/MD) and run deterministic audit checks.",
+                "Open exported deliverable bytes (XLSX, ZIP, IFC4 STEP, DXF, PDF, DOCX/MD) and run deterministic audit checks.",
                 ["path"],
                 path={"type": "string", "description": "Container path to deliverable."},
-                audit_kind={"type": "string", "enum": ["auto", "workbook", "zip", "ifc", "decision_memo"]},
+                audit_kind={"type": "string", "enum": ["auto", "workbook", "zip", "ifc", "dxf", "pdf", "decision_memo"]},
                 narrative_path={"type": "string", "description": "Optional companion narrative markdown/text path."},
                 required_items={"type": "array", "items": {"type": "string"}},
                 required_endpoints={"type": "object", "description": "Mapping {service: [[x,y,z], ...]}."},
@@ -256,6 +276,10 @@ def build_base_tools(config: RuntimeConfig) -> list[dict[str, Any]]:
                 expected_work_package={"type": "object"},
                 actual_work_package={"type": "object"},
                 require_cached_formulas={"type": "boolean"},
+                required_layers={"type": "array", "items": {"type": "string"}},
+                required_text={"type": "array", "items": {"type": "string"}},
+                required_terms={"type": "array", "items": {"type": "string"}},
+                min_pages={"type": "integer"},
             )
         )
     if config.enable_incumbent_retention:
@@ -368,19 +392,46 @@ def drop_thinking(message: dict[str, Any], unless: Any = lambda _: False) -> dic
         message["thinking_blocks"] = kept
     else:
         message.pop("thinking_blocks", None)
+    fields = message.get("provider_specific_fields")
+    if isinstance(fields, dict) and isinstance(fields.get("thinking_blocks"), list):
+        kept_psf = [b for b in fields["thinking_blocks"] if unless(b)]
+        if kept_psf:
+            message["provider_specific_fields"] = {**fields, "thinking_blocks": kept_psf}
+        else:
+            rest = {k: v for k, v in fields.items() if k != "thinking_blocks"}
+            if rest:
+                message["provider_specific_fields"] = rest
+            else:
+                message.pop("provider_specific_fields", None)
     return message
+
+
+def _without_cache_control(message: dict[str, Any]) -> dict[str, Any]:
+    cleaned = {k: v for k, v in message.items() if k != "cache_control"}
+    content = cleaned.get("content")
+    if isinstance(content, list):
+        cleaned["content"] = [
+            {k: v for k, v in part.items() if k != "cache_control"} if isinstance(part, dict) else part
+            for part in content
+        ]
+    return cleaned
 
 
 def marked(messages: list[dict[str, Any]], enabled: bool) -> list[dict[str, Any]]:
     if not enabled or not messages:
         return messages
-    out = list(messages)
+    out = [_without_cache_control(m) for m in messages]
     for i in {0, len(out) - 1}:
         m, content = out[i], out[i].get("content")
         if isinstance(content, str) and content:
             out[i] = {
                 **m,
                 "content": [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}],
+            }
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            out[i] = {
+                **m,
+                "content": [*content[:-1], {**content[-1], "cache_control": {"type": "ephemeral"}}],
             }
         else:
             out[i] = {**m, "cache_control": {"type": "ephemeral"}}
@@ -549,7 +600,10 @@ class EngineeringCoordinator:
         self.config = config or RuntimeConfig.from_env()
         self.client = client or create_client()
         self.tools = build_base_tools(self.config)
-        self.catalog = MCPCatalog(mode=self.config.mcp_discovery_mode)
+        self.catalog = MCPCatalog(
+            mode=self.config.mcp_discovery_mode,
+            direct_threshold=self.config.mcp_direct_max_tools,
+        )
         self.ledger = EvidenceLedger()
         self.usage_tracker = UsageTracker(
             self.config.model_name,
@@ -561,6 +615,7 @@ class EngineeringCoordinator:
         self.context_window: int | None = None
         self.max_output = self.output_ceiling
         self.token_limit = "max_completion_tokens"
+        self.stream_options: dict[str, Any] = {"stream_options": {"include_usage": True}}
         self.effort: dict[str, Any] = {"reasoning_effort": self.config.reasoning_effort}
         self.responses = self.config.responses_api
         self.finish_margin = float(self.config.reserve_verify_sec)
@@ -570,6 +625,7 @@ class EngineeringCoordinator:
         self.incumbents: dict[str, tuple[bytes, str]] = {}
         self.incumbent_total_bytes = 0
         self._write_seq = 0
+        self._wrote_after_mcp = False
         self._pending_images: list[tuple[str, str]] = []
         self._last_durable_summary = ""
 
@@ -602,6 +658,8 @@ class EngineeringCoordinator:
                     return await self.finish("Time is almost up.")
                 if self.usage_tracker.budget_exhausted():
                     return self._budget_stop_summary()
+                if self.config.max_model_calls > 0 and self.usage_tracker.calls >= self.config.max_model_calls:
+                    return await self.finish(f"Configured MAX_MODEL_CALLS ({self.config.max_model_calls}) reached.")
                 try:
                     reply = await self.complete(head=head)
                 except BudgetExhausted:
@@ -649,15 +707,50 @@ class EngineeringCoordinator:
                     continue
 
                 nudges, head = 0, ""
-                for call, args in zip(reply.calls.values(), arguments):
-                    result = (
+                calls_list = list(reply.calls.values())
+                has_mcp_call = any(self.catalog.is_mcp_tool(c["name"]) for c in calls_list)
+                unqueried_mcp = bool(self.catalog.registry) and self.catalog.successful_calls == 0
+                deferred_msg = (
+                    "deferred: inspect the MCP result returned in this turn before calling "
+                    "write_file/edit_file so you write verified data"
+                )
+                pre_mcp_msg = (
+                    "deferred: connected MCP tool(s) have not been called yet; invoke the needed MCP "
+                    "tool first and wait for its returned result before writing deliverables"
+                )
+                results: list[str | None] = [None] * len(calls_list)
+                # Execute MCP tool calls before any other calls; defer premature writes/edits in the same batch
+                # or deliverable writes attempted before any connected MCP tool has succeeded.
+                for idx, (call, args) in enumerate(zip(calls_list, arguments)):
+                    if call["name"] in ("write_file", "edit_file"):
+                        target_path = str(args.get("path") or "").lower() if isinstance(args, dict) else ""
+                        is_script = target_path.endswith((".py", ".sh"))
+                        if isinstance(args, dict) and (has_mcp_call or (unqueried_mcp and not is_script)):
+                            await self.session.log(f"deferred {call['name']} pending MCP observation")
+                            results[idx] = deferred_msg if has_mcp_call else pre_mcp_msg
+                            continue
+                        if not isinstance(args, dict) and has_mcp_call:
+                            results[idx] = args
+                            continue
+                    if self.catalog.is_mcp_tool(call["name"]):
+                        results[idx] = (
+                            await self.run_tool(call["name"], args)
+                            if isinstance(args, dict)
+                            else args
+                        )
+                for idx, (call, args) in enumerate(zip(calls_list, arguments)):
+                    if results[idx] is not None:
+                        continue
+                    results[idx] = (
                         await self.run_tool(call["name"], args)
                         if isinstance(args, dict)
                         else args
                     )
+                for call, args, result in zip(calls_list, arguments, results):
+                    res_text = result if result is not None else ""
                     if reply.finish == "length" and isinstance(args, str):
-                        result += f" Reply hit {self.max_output}-token limit; write large files in parts."
-                    self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                        res_text += f" Reply hit {self.max_output}-token limit; write large files in parts."
+                    self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": res_text})
 
                 if self._pending_images:
                     content_parts: list[dict[str, Any]] = [
@@ -696,6 +789,34 @@ class EngineeringCoordinator:
     async def _pre_completion_gate(self, narrative_text: str) -> str | None:
         """Runs deterministic cold-read checks before accepting final completion."""
         issues: list[str] = []
+        used_any_tool = any(m.get("role") == "tool" for m in self.messages)
+        if self.catalog.registry and self.catalog.successful_calls == 0:
+            tools_hint = ", ".join(sorted(self.catalog.registry)[:6])
+            issues.append(
+                f"Connected MCP tool(s) ({tools_hint}) have not returned a successful result yet. "
+                "Call the needed MCP tool directly now, read its output, and write/update deliverables with that exact output."
+            )
+        elif self.catalog.registry and self.catalog.successful_calls > 0 and not self._wrote_after_mcp and (
+            m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or "")
+        ):
+            requested = ", ".join(sorted(set(m_deliv))[:4])
+            issues.append(
+                f"No deliverable ({requested}) was written or updated after observing the MCP tool output. "
+                "Call write_file/edit_file with the exact observed MCP result before finishing."
+            )
+        elif not self.touched_deliverables and (
+            m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or "")
+        ):
+            requested = ", ".join(sorted(set(m_deliv))[:4])
+            issues.append(
+                f"Requested deliverable file(s) ({requested}) have not been written on disk yet. "
+                "Use write_file or bash to create and verify the requested file(s) before finishing."
+            )
+        elif not used_any_tool and OUTPUT_PATH_RE.search(self.session.instruction or ""):
+            issues.append(
+                "No workspace tools have been called and no deliverable files were created on disk. "
+                "Execute tool calls (write_file, bash, read_file) to create and verify the requested deliverables."
+            )
         if self.config.enable_evidence_ledger:
             conflicts = self.ledger.unresolved_conflicts()
             if conflicts:
@@ -722,8 +843,7 @@ class EngineeringCoordinator:
         if not issues:
             return None
         return (
-            "Before finalizing, resolve these concrete verification issues (fix the underlying file/data or resolve "
-            "conflicts via record_evidence/restore_incumbent, then re-verify with run_export_audit):\n- "
+            "Action required before finishing (execute the needed tool calls now rather than replying in text):\n- "
             + "\n- ".join(issues)
         )
 
@@ -800,6 +920,7 @@ class EngineeringCoordinator:
         return (
             self.use_responses(error)
             or self.use_max_tokens(error)
+            or self.drop_stream_options(error)
             or self.drop_effort(error)
             or self.shrink_output(error)
         )
@@ -820,8 +941,18 @@ class EngineeringCoordinator:
         self.token_limit = "max_tokens"
         return True
 
+    def drop_stream_options(self, error: str) -> bool:
+        if not self.stream_options or "stream_options" not in error.lower() or not UNSUPPORTED.search(error):
+            return False
+        self.stream_options = {}
+        return True
+
     def drop_effort(self, error: str) -> bool:
-        if not self.effort or not re.search(r"reasoning[._]effort", error):
+        if not self.effort or not re.search(
+            r"reasoning[._]effort|does not support thinking|thinking.{0,20}(?:not|un)supported",
+            error,
+            re.I,
+        ):
             return False
         self.effort = {}
         return True
@@ -900,7 +1031,7 @@ class EngineeringCoordinator:
                 tools=self.tools,
                 tool_choice=tool_choice,
                 stream=True,
-                stream_options={"include_usage": True},
+                **self.stream_options,
                 **self.effort,
                 **{self.token_limit: self.max_output},
             )
@@ -1037,6 +1168,8 @@ class EngineeringCoordinator:
         self._write_seq += 1
         norm = self._resolve(path)
         self.touched_deliverables[norm] = self._write_seq
+        if self.catalog.successful_calls > 0:
+            self._wrote_after_mcp = True
         if from_bash:
             self.bash_detected_paths.add(norm)
         else:
@@ -1071,23 +1204,26 @@ class EngineeringCoordinator:
             return f"{path} is binary ({len(data)} bytes); inspect via bash or run_export_audit"
         return data.decode("utf-8", "replace") or "(empty file)"
 
-    async def _tool_write_file(self, path: str, content: str, append: bool = False) -> str:
+    async def _tool_write_file(self, path: str, content: str, append: bool | str = False) -> str:
         resolved = self._resolve(path)
-        size = await self.session.write_file(resolved, content, append=bool(append))
+        size = await self.session.write_file(resolved, content, append=_as_bool(append))
         self._note_written_path(resolved)
         return f"{path} now holds {size} bytes"
 
-    async def _tool_edit_file(self, path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
+    async def _tool_edit_file(
+        self, path: str, old_text: str, new_text: str, replace_all: bool | str = False
+    ) -> str:
         resolved = self._resolve(path)
+        do_replace_all = _as_bool(replace_all)
         text = (await self.session.read_file(resolved)).decode("utf-8")
         count = text.count(old_text) if old_text else 0
         if count == 0:
             return f"error: old_text was not found in {path}"
-        if count > 1 and not replace_all:
+        if count > 1 and not do_replace_all:
             return f"error: old_text occurs {count} times in {path}; supply more context or replace_all=true"
-        await self.session.write_file(resolved, text.replace(old_text, new_text, -1 if replace_all else 1))
+        await self.session.write_file(resolved, text.replace(old_text, new_text, -1 if do_replace_all else 1))
         self._note_written_path(resolved)
-        return f"replaced {count if replace_all else 1} occurrence(s) in {path}"
+        return f"replaced {count if do_replace_all else 1} occurrence(s) in {path}"
 
     async def _tool_record_evidence(self, **kwargs: Any) -> str:
         entry = self.ledger.record(**kwargs)
@@ -1136,6 +1272,10 @@ class EngineeringCoordinator:
         expected_work_package: dict[str, Any] | None = None,
         actual_work_package: dict[str, Any] | None = None,
         require_cached_formulas: bool = False,
+        required_layers: list[str] | None = None,
+        required_text: list[str] | None = None,
+        required_terms: list[str] | None = None,
+        min_pages: int = 1,
     ) -> dict[str, Any]:
         resolved = self._resolve(path)
         try:
@@ -1159,6 +1299,10 @@ class EngineeringCoordinator:
                 kind = "zip"
             elif lower.endswith(".ifc"):
                 kind = "ifc"
+            elif lower.endswith(".dxf"):
+                kind = "dxf"
+            elif lower.endswith(".pdf"):
+                kind = "pdf"
             elif lower.endswith((".docx", ".md", ".txt")):
                 kind = "decision_memo"
             else:
@@ -1226,6 +1370,22 @@ class EngineeringCoordinator:
                 "total_route_length": ifc_res.total_route_length,
                 "defects": ifc_res.defects,
             }
+        if kind == "dxf":
+            res = audit_dxf_bytes(
+                raw,
+                required_layers=required_layers,
+                required_text=required_text,
+            )
+            res["path"] = resolved
+            return res
+        if kind == "pdf":
+            res = audit_pdf_bytes(
+                raw,
+                required_terms=required_terms,
+                min_pages=max(1, int(min_pages or 1)),
+            )
+            res["path"] = resolved
+            return res
         if kind == "decision_memo":
             basename = posixpath.basename(lower)
             has_memo_context = bool(

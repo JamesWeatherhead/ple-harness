@@ -121,12 +121,19 @@ ONDEMAND_CORE_TOOLS = [
 
 
 class MCPCatalog:
-    """Manages task-local MCP servers in `ondemand` or `eager` discovery mode."""
+    """Manages task-local MCP servers in `ondemand` (with small-catalog direct fast-path) or `eager` mode."""
 
-    def __init__(self, mode: str = "ondemand", max_direct_tools: int = 128, max_direct_chars: int = 40_000):
+    def __init__(
+        self,
+        mode: str = "ondemand",
+        max_direct_tools: int = 128,
+        max_direct_chars: int = 40_000,
+        direct_threshold: int = 8,
+    ):
         self.mode = mode if mode in ("ondemand", "eager") else "ondemand"
         self.max_direct_tools = max_direct_tools
         self.max_direct_chars = max_direct_chars
+        self.direct_threshold = max(0, int(direct_threshold))
         self.servers: dict[str, MCPServerWrapper] = {}
         self.registry: dict[str, tuple[MCPServerWrapper, dict[str, Any]]] = {}
         self.direct_functions: list[dict[str, Any]] = []
@@ -134,8 +141,31 @@ class MCPCatalog:
         self.successful_calls: int = 0
         self.failed_calls: int = 0
 
+    def _build_direct_functions(self) -> list[dict[str, Any]]:
+        """Builds OpenAI function schemas for all registered MCP tools, preserving schema properties."""
+        funcs: list[dict[str, Any]] = []
+        for name, (_, t) in self.registry.items():
+            raw_schema = t.get("inputSchema") or {}
+            params = {k: v for k, v in raw_schema.items() if k != "$schema"}
+            if not params:
+                params = {"type": "object", "properties": {}}
+            elif params.get("type") == "object" and "properties" not in params:
+                params = {**params, "properties": {}}
+            funcs.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": (t.get("description") or t["name"])[:1024],
+                        "parameters": params,
+                    },
+                }
+            )
+        return funcs
+
     async def connect(self, session: taskbridge.Session) -> str:
         """Initializes all session MCP servers and builds system prompt guidance."""
+        self.direct_functions = []
         for spec in session.mcp_servers:
             srv = MCPServerWrapper(session, spec)
             try:
@@ -154,48 +184,51 @@ class MCPCatalog:
             return ""
 
         if self.mode == "eager":
-            funcs = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": (t.get("description") or t["name"])[:1024],
-                        "parameters": (
-                            {k: v for k, v in (t.get("inputSchema") or {}).items() if k != "$schema"}
-                            or {"type": "object", "properties": {}}
-                        ),
-                    },
-                }
-                for name, (_, t) in self.registry.items()
-            ]
+            funcs = self._build_direct_functions()
             # Respect OpenAI's hard 128-function ceiling only if provider rejects more,
             # while allowing callers to inspect exact schema size in eager experiments.
             if len(funcs) <= self.max_direct_tools and len(json.dumps(funcs)) <= self.max_direct_chars:
                 self.direct_functions = funcs
-                return "\n\nThe task provides MCP application tools directly as `<server>__<tool>` functions."
+                return (
+                    "\n\nThe task provides MCP application tools directly as `<server>__<tool>` functions. "
+                    "Call the needed tool directly and await its returned result before writing files."
+                )
             # Even in eager mode if > max_direct_tools we expose all up to max_direct_tools or fallback
             self.direct_functions = funcs
             return (
                 f"\n\nThe task provides {len(funcs)} MCP application tools loaded eagerly."
             )
 
-        # On-demand mode: concise server summary only, full schemas fetched lazily
         summary_lines = [
             f"- {sname}: {len(srv.tools)} tools"
             for sname, srv in self.servers.items()
         ]
+        if self.direct_threshold > 0 and len(self.registry) <= self.direct_threshold:
+            funcs = self._build_direct_functions()
+            if len(funcs) <= self.max_direct_tools and len(json.dumps(funcs)) <= self.max_direct_chars:
+                self.direct_functions = funcs
+                direct_list = ", ".join(f"`{name}`" for name in self.registry)
+                return (
+                    "\n\nConnected MCP tools exposed directly: "
+                    f"{direct_list} ("
+                    + ", ".join(f"{sname}: {len(srv.tools)}" for sname, srv in self.servers.items())
+                    + "). Invoke the needed MCP tool call directly first, await its returned result, "
+                    "and only then call `write_file` or `edit_file` with that exact returned value."
+                )
+
+        # On-demand mode: concise server summary only, full schemas fetched lazily
         return (
             "\n\nThe task provides local MCP application services:\n"
             + "\n".join(summary_lines)
             + "\nUse `mcp_list_servers`, `mcp_search_tools`, `mcp_get_tool_schema`, and `mcp_call_tool` "
-            "to discover schemas on demand and inspect/update application records."
+            "to discover schemas on demand, and await the returned MCP observation before writing files."
         )
 
     def exposed_tools(self) -> list[dict[str, Any]]:
         """Returns the MCP tool definitions to inject into the LLM `tools` array."""
         if not self.registry:
             return []
-        if self.mode == "eager":
+        if self.mode == "eager" or self.direct_functions:
             return list(self.direct_functions)
         return list(ONDEMAND_CORE_TOOLS)
 
@@ -368,8 +401,11 @@ class MCPCatalog:
         return f"error: unknown MCP tool {tool_name!r}"
 
     def stats(self) -> dict[str, Any]:
+        effective_mode = "direct" if (self.mode != "eager" and self.direct_functions) else self.mode
         return {
             "mode": self.mode,
+            "effective_mode": effective_mode,
+            "direct_threshold": self.direct_threshold,
             "servers": len(self.servers),
             "total_catalog_tools": len(self.registry),
             "exposed_tools_count": len(self.exposed_tools()),

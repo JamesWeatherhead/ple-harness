@@ -118,3 +118,16 @@ def test_single_prerequisite_flip_inverts_decision_without_perturbing_others() -
     )
     assert not mismatch_audit["ok"]
     assert any(d["item"] == "work_package.status" for d in mismatch_audit["defects"])
+
+
+def test_empty_memo_and_future_effective_date_blocked() -> None:
+    short_audit = audit_decision_memo(b"too short", is_docx=False)
+    assert not short_audit["ok"]
+    assert any(d["item"] == "memo_non_empty" for d in short_audit["defects"])
+
+    future_prereqs = [
+        {"id": "PR-01", "status": "approved", "effective_date": "2026-10-20"},
+    ]
+    eval_res = evaluate_energization_decision("2026-10-15", future_prereqs)
+    assert eval_res["decision"] == "NOT_APPROVED_PENDING"
+    assert eval_res["blocking_items"] == ["PR-01"]

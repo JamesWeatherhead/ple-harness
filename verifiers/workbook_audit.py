@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import ast
 import io
+import math
 import operator
 import re
 import zipfile
 from typing import Any
 
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 ERROR_TOKENS = ("#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A", "#NUM!", "#NULL!")
 
@@ -30,6 +32,11 @@ _CELL_REF_RE = re.compile(
 _RANGE_REF_RE = re.compile(
     r"(?:(?:'([^']+)'|([A-Za-z0-9_]+))!)?\$?([A-Z]{1,3})\$?(\d+):\$?([A-Z]{1,3})\$?(\d+)"
 )
+_FUNC_CALL_RE = re.compile(r"\b(SUM|AVERAGE|MIN|MAX|COUNT|ROUND)\s*\(", re.I)
+
+
+class _CircularReferenceError(Exception):
+    """Internal signal raised when formula evaluation encounters a cycle."""
 
 
 def _col_idx(letters: str) -> int:
@@ -39,75 +46,8 @@ def _col_idx(letters: str) -> int:
     return n
 
 
-def _eval_simple_formula(
-    formula: str,
-    sheet_name: str,
-    wb_formulas: openpyxl.Workbook,
-    wb_values: openpyxl.Workbook,
-    depth: int = 0,
-) -> float | None:
-    """Evaluates common arithmetic / SUM Excel formulas without executing arbitrary code."""
-    if depth > 12 or not isinstance(formula, str) or not formula.startswith("="):
-        return None
-    expr = formula[1:].strip()
-
-    def get_cell(sname: str, col_str: str, row_num: int) -> float:
-        ws_f = wb_formulas[sname]
-        ws_v = wb_values[sname]
-        c = _col_idx(col_str)
-        val = ws_v.cell(row_num, c).value
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            return float(val)
-        raw_f = ws_f.cell(row_num, c).value
-        if isinstance(raw_f, (int, float)) and not isinstance(raw_f, bool):
-            return float(raw_f)
-        if isinstance(raw_f, str) and raw_f.startswith("="):
-            res = _eval_simple_formula(raw_f, sname, wb_formulas, wb_values, depth + 1)
-            if res is not None:
-                return res
-        raise ValueError(f"Unresolvable cell {sname}!{col_str}{row_num}")
-
-    # Expand SUM(...) first
-    def repl_sum(match: re.Match[str]) -> str:
-        inner = match.group(1)
-        total = 0.0
-        for part in inner.split(","):
-            part = part.strip()
-            rm = _RANGE_REF_RE.fullmatch(part)
-            if rm:
-                sname = rm.group(1) or rm.group(2) or sheet_name
-                c1, r1 = _col_idx(rm.group(3)), int(rm.group(4))
-                c2, r2 = _col_idx(rm.group(5)), int(rm.group(6))
-                for rr in range(min(r1, r2), max(r1, r2) + 1):
-                    for cc in range(min(c1, c2), max(c1, c2) + 1):
-                        ws_f = wb_formulas[sname]
-                        ws_v = wb_values[sname]
-                        vv = ws_v.cell(rr, cc).value
-                        if vv is None:
-                            rf = ws_f.cell(rr, cc).value
-                            if isinstance(rf, (int, float)):
-                                vv = rf
-                            elif isinstance(rf, str) and rf.startswith("="):
-                                vv = _eval_simple_formula(rf, sname, wb_formulas, wb_values, depth + 1)
-                        if isinstance(vv, (int, float)):
-                            total += float(vv)
-            else:
-                cm = _CELL_REF_RE.fullmatch(part)
-                if not cm:
-                    raise ValueError(f"Unsupported SUM arg: {part}")
-                sname = cm.group(1) or cm.group(2) or sheet_name
-                total += get_cell(sname, cm.group(3), int(cm.group(4)))
-        return repr(total)
-
-    try:
-        expr = re.sub(r"\bSUM\(([^()]+)\)", repl_sum, expr, flags=re.I)
-        expr = _CELL_REF_RE.sub(
-            lambda m: repr(get_cell(m.group(1) or m.group(2) or sheet_name, m.group(3), int(m.group(4)))),
-            expr,
-        )
-        node = ast.parse(expr, mode="eval")
-    except Exception:
-        return None
+def _eval_arith_ast(expr: str) -> float:
+    node = ast.parse(expr, mode="eval")
 
     def ev(n: ast.AST) -> float:
         if isinstance(n, ast.Expression):
@@ -120,8 +60,205 @@ def _eval_simple_formula(
             return _BIN_OPS[type(n.op)](ev(n.left), ev(n.right))
         raise ValueError("Unsupported AST node")
 
+    val = ev(node)
+    if not math.isfinite(val):
+        raise ValueError("Non-finite arithmetic result")
+    return val
+
+
+def _split_top_level_args(arg_str: str) -> list[str]:
+    args: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    in_quote = False
+    for ch in arg_str:
+        if ch == "'":
+            in_quote = not in_quote
+            cur.append(ch)
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                args.append("".join(cur).strip())
+                cur = []
+                continue
+            cur.append(ch)
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail or args:
+        args.append(tail)
+    return args
+
+
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    in_quote = False
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if ch == "'":
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx
+    raise ValueError("Unbalanced parentheses in formula")
+
+
+def _eval_simple_formula(
+    formula: str,
+    sheet_name: str,
+    wb_formulas: openpyxl.Workbook,
+    wb_values: openpyxl.Workbook,
+    depth: int = 0,
+    visiting: frozenset[tuple[str, int, int]] = frozenset(),
+    circular_refs: list[str] | None = None,
+    _verified_cache: dict[tuple[str, int, int], float] | None = None,
+) -> float | None:
+    """Evaluates arithmetic and SUM/AVERAGE/MIN/MAX/COUNT/ROUND Excel formulas with cycle detection."""
+    if depth > 24 or not isinstance(formula, str) or not formula.startswith("="):
+        return None
+    expr = formula[1:].strip()
+    if _verified_cache is None:
+        _verified_cache = {}
+
+    def resolve_cell(sname: str, col_idx: int, row_num: int, *, require_value: bool = True) -> float | None:
+        cell_key = (sname, row_num, col_idx)
+        if cell_key in visiting:
+            ref_label = f"{sname}!{get_column_letter(col_idx)}{row_num}"
+            if circular_refs is not None and ref_label not in circular_refs:
+                circular_refs.append(ref_label)
+            raise _CircularReferenceError(ref_label)
+
+        if cell_key in _verified_cache:
+            return _verified_cache[cell_key]
+
+        ws_f = wb_formulas[sname]
+        ws_v = wb_values[sname]
+        val = ws_v.cell(row_num, col_idx).value
+        raw_f = ws_f.cell(row_num, col_idx).value
+
+        if isinstance(raw_f, str) and raw_f.startswith("="):
+            if circular_refs is not None or not isinstance(val, (int, float)) or isinstance(val, bool):
+                res = _eval_simple_formula(
+                    raw_f,
+                    sname,
+                    wb_formulas,
+                    wb_values,
+                    depth + 1,
+                    visiting | {cell_key},
+                    circular_refs,
+                    _verified_cache,
+                )
+                if res is not None:
+                    _verified_cache[cell_key] = res
+                    return res
+
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            fval = float(val)
+            _verified_cache[cell_key] = fval
+            return fval
+        if isinstance(raw_f, (int, float)) and not isinstance(raw_f, bool):
+            fval = float(raw_f)
+            _verified_cache[cell_key] = fval
+            return fval
+        if require_value:
+            raise ValueError(f"Unresolvable cell {sname}!{get_column_letter(col_idx)}{row_num}")
+        return None
+
+    def get_cell(sname: str, col_str: str, row_num: int) -> float:
+        res = resolve_cell(sname, _col_idx(col_str), row_num, require_value=True)
+        assert res is not None
+        return res
+
+    def collect_arg_values(parts: list[str]) -> list[float]:
+        values: list[float] = []
+        for part in parts:
+            if not part:
+                continue
+            rm = _RANGE_REF_RE.fullmatch(part)
+            if rm:
+                sname = rm.group(1) or rm.group(2) or sheet_name
+                c1, r1 = _col_idx(rm.group(3)), int(rm.group(4))
+                c2, r2 = _col_idx(rm.group(5)), int(rm.group(6))
+                for rr in range(min(r1, r2), max(r1, r2) + 1):
+                    for cc in range(min(c1, c2), max(c1, c2) + 1):
+                        vv = resolve_cell(sname, cc, rr, require_value=False)
+                        if vv is not None:
+                            values.append(vv)
+                continue
+            cm = _CELL_REF_RE.fullmatch(part)
+            if cm:
+                sname = cm.group(1) or cm.group(2) or sheet_name
+                vv = resolve_cell(sname, _col_idx(cm.group(3)), int(cm.group(4)), require_value=False)
+                if vv is not None:
+                    values.append(vv)
+                continue
+            sub = _CELL_REF_RE.sub(
+                lambda m: repr(get_cell(m.group(1) or m.group(2) or sheet_name, m.group(3), int(m.group(4)))),
+                part,
+            )
+            values.append(_eval_arith_ast(sub))
+        return values
+
+    def eval_func_call(func_name: str, arg_str: str) -> float:
+        parts = _split_top_level_args(arg_str)
+        fname = func_name.upper()
+        if fname == "ROUND":
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise ValueError(f"ROUND expects 2 arguments, got {parts!r}")
+            x_expr = _CELL_REF_RE.sub(
+                lambda m: repr(get_cell(m.group(1) or m.group(2) or sheet_name, m.group(3), int(m.group(4)))),
+                parts[0],
+            )
+            n_expr = _CELL_REF_RE.sub(
+                lambda m: repr(get_cell(m.group(1) or m.group(2) or sheet_name, m.group(3), int(m.group(4)))),
+                parts[1],
+            )
+            x_val = _eval_arith_ast(x_expr)
+            n_val = int(round(_eval_arith_ast(n_expr)))
+            return float(round(x_val, n_val))
+
+        values = collect_arg_values(parts)
+        if fname == "SUM":
+            return float(sum(values))
+        if fname == "COUNT":
+            return float(len(values))
+        if fname == "AVERAGE":
+            if not values:
+                raise ValueError("AVERAGE over empty values")
+            return float(sum(values) / len(values))
+        if fname == "MIN":
+            return float(min(values)) if values else 0.0
+        if fname == "MAX":
+            return float(max(values)) if values else 0.0
+        raise ValueError(f"Unsupported function: {func_name}")
+
     try:
-        return ev(node)
+        while True:
+            matches = list(_FUNC_CALL_RE.finditer(expr))
+            if not matches:
+                break
+            m = matches[-1]
+            open_paren_idx = m.end() - 1
+            close_paren_idx = _find_matching_paren(expr, open_paren_idx)
+            func_val = eval_func_call(m.group(1), expr[open_paren_idx + 1 : close_paren_idx])
+            expr = expr[: m.start()] + repr(func_val) + expr[close_paren_idx + 1 :]
+
+        expr = _CELL_REF_RE.sub(
+            lambda m: repr(get_cell(m.group(1) or m.group(2) or sheet_name, m.group(3), int(m.group(4)))),
+            expr,
+        )
+        return _eval_arith_ast(expr)
+    except _CircularReferenceError:
+        if depth > 0:
+            raise
+        return None
     except Exception:
         return None
 
@@ -146,7 +283,15 @@ def make_defect(
     }
 
 
-def _sheet_rows_as_dicts(ws_f: Any, ws_v: Any, sheet_name: str, wb_f: Any, wb_v: Any) -> list[dict[str, Any]]:
+def _sheet_rows_as_dicts(
+    ws_f: Any,
+    ws_v: Any,
+    sheet_name: str,
+    wb_f: Any,
+    wb_v: Any,
+    *,
+    verified_cache: dict[tuple[str, int, int], float] | None = None,
+) -> list[dict[str, Any]]:
     if ws_f.max_row < 2:
         return []
     headers = [str(ws_v.cell(1, c).value or f"col_{c}").strip() for c in range(1, ws_f.max_column + 1)]
@@ -159,7 +304,14 @@ def _sheet_rows_as_dicts(ws_f: Any, ws_v: Any, sheet_name: str, wb_f: Any, wb_v:
             if val is None:
                 raw_f = ws_f.cell(r, c).value
                 if isinstance(raw_f, str) and raw_f.startswith("="):
-                    val = _eval_simple_formula(raw_f, sheet_name, wb_f, wb_v)
+                    val = _eval_simple_formula(
+                        raw_f,
+                        sheet_name,
+                        wb_f,
+                        wb_v,
+                        visiting=frozenset({(sheet_name, r, c)}),
+                        _verified_cache=verified_cache,
+                    )
                 else:
                     val = raw_f
             if val is not None:
@@ -192,6 +344,8 @@ def audit_workbook_bytes(
 
     formula_errors: list[dict[str, Any]] = []
     uncached_formulas: list[str] = []
+    circular_refs: list[str] = []
+    verified_cache: dict[tuple[str, int, int], float] = {}
     for sname in wb_f.sheetnames:
         ws_f = wb_f[sname]
         ws_v = wb_v[sname]
@@ -202,8 +356,19 @@ def audit_workbook_bytes(
                 for check_val in (fv, vv):
                     if isinstance(check_val, str) and any(tok in check_val for tok in ERROR_TOKENS):
                         formula_errors.append({"sheet": sname, "row": r, "col": c, "value": check_val})
-                if isinstance(fv, str) and fv.startswith("=") and vv is None:
-                    uncached_formulas.append(f"{sname}!R{r}C{c}")
+                if isinstance(fv, str) and fv.startswith("="):
+                    if vv is None:
+                        uncached_formulas.append(f"{sname}!R{r}C{c}")
+                    _eval_simple_formula(
+                        fv,
+                        sname,
+                        wb_f,
+                        wb_v,
+                        depth=0,
+                        visiting=frozenset({(sname, r, c)}),
+                        circular_refs=circular_refs,
+                        _verified_cache=verified_cache,
+                    )
 
     if formula_errors:
         defects.append(
@@ -214,6 +379,18 @@ def audit_workbook_bytes(
                 limit=0,
                 tolerance=0,
                 earliest_suspect_dependency=f"{formula_errors[0]['sheet']} row {formula_errors[0]['row']}: {formula_errors[0]['value']}",
+            )
+        )
+
+    if circular_refs:
+        defects.append(
+            make_defect(
+                item="workbook_circular_references",
+                requirement_source="XLSX formula acyclicity check",
+                measured=circular_refs,
+                limit=0,
+                tolerance=0,
+                earliest_suspect_dependency=f"Circular reference involving {circular_refs[0]}",
             )
         )
 
@@ -235,7 +412,9 @@ def audit_workbook_bytes(
     present_items: set[str] = set()
     items_rows: list[dict[str, Any]] = []
     if items_sheet in wb_f.sheetnames:
-        items_rows = _sheet_rows_as_dicts(wb_f[items_sheet], wb_v[items_sheet], items_sheet, wb_f, wb_v)
+        items_rows = _sheet_rows_as_dicts(
+            wb_f[items_sheet], wb_v[items_sheet], items_sheet, wb_f, wb_v, verified_cache=verified_cache
+        )
         for row in items_rows:
             if row.get("item_id"):
                 present_items.add(str(row["item_id"]).strip())
@@ -257,8 +436,12 @@ def audit_workbook_bytes(
     # Independent detail -> summary rollup check
     rollup_checks = 0
     if detail_sheet in wb_f.sheetnames and summary_sheet in wb_f.sheetnames:
-        det_rows = _sheet_rows_as_dicts(wb_f[detail_sheet], wb_v[detail_sheet], detail_sheet, wb_f, wb_v)
-        sum_rows = _sheet_rows_as_dicts(wb_f[summary_sheet], wb_v[summary_sheet], summary_sheet, wb_f, wb_v)
+        det_rows = _sheet_rows_as_dicts(
+            wb_f[detail_sheet], wb_v[detail_sheet], detail_sheet, wb_f, wb_v, verified_cache=verified_cache
+        )
+        sum_rows = _sheet_rows_as_dicts(
+            wb_f[summary_sheet], wb_v[summary_sheet], summary_sheet, wb_f, wb_v, verified_cache=verified_cache
+        )
         grouped: dict[tuple[str, ...], dict[str, float]] = {}
         for row in det_rows:
             key = tuple(str(row.get(gc) or "").strip() for gc in group_cols)
@@ -375,6 +558,7 @@ def audit_workbook_bytes(
         "ok": len(defects) == 0,
         "sheets": wb_f.sheetnames,
         "formula_errors": len(formula_errors),
+        "circular_references": len(circular_refs),
         "uncached_formulas": len(uncached_formulas),
         "rollup_checks": rollup_checks,
         "items_found": sorted(present_items),

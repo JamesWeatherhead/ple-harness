@@ -9,8 +9,10 @@ import zipfile
 
 import openpyxl
 
+from evidence import EvidenceLedger, convert_unit
 from harness import EngineeringCoordinator, RuntimeConfig
 from verifiers import audit_workbook_bytes, audit_zip_deliverables
+from verifiers.workbook_audit import _eval_simple_formula
 
 
 def _inject_cached_formula_values(xlsx_bytes: bytes, cached: dict[tuple[str, str], float]) -> bytes:
@@ -239,3 +241,95 @@ def test_repair_and_incumbent_rollback() -> None:
         assert r_restored["ok"], r_restored
 
     asyncio.run(scenario())
+
+
+def test_formula_functions_and_circular_reference_detection() -> None:
+    import math
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Calc"
+    ws["A1"] = 10.0
+    ws["A2"] = 20.0
+    ws["A3"] = 30.0
+    ws["A4"] = "ignore_text"
+    ws["A5"] = None
+    ws["B1"] = "=AVERAGE(A1:A5)"
+    ws["B2"] = "=MIN(A1:A3)"
+    ws["B3"] = "=MAX(A1:A3, B1 * 2)"
+    ws["B4"] = "=COUNT(A1:A5)"
+    ws["B5"] = "=ROUND(AVERAGE(A1:A3) / 7, 3)"
+    ws["B6"] = "=ROUND((A1 + A2) * 1.125, 1)"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    wb_f = openpyxl.load_workbook(io.BytesIO(buf.getvalue()), data_only=False)
+    wb_v = openpyxl.load_workbook(io.BytesIO(buf.getvalue()), data_only=True)
+
+    assert math.isclose(_eval_simple_formula(ws["B1"].value, "Calc", wb_f, wb_v) or 0.0, 20.0)
+    assert math.isclose(_eval_simple_formula(ws["B2"].value, "Calc", wb_f, wb_v) or 0.0, 10.0)
+    assert math.isclose(_eval_simple_formula(ws["B3"].value, "Calc", wb_f, wb_v) or 0.0, 40.0)
+    assert math.isclose(_eval_simple_formula(ws["B4"].value, "Calc", wb_f, wb_v) or 0.0, 3.0)
+    assert math.isclose(_eval_simple_formula(ws["B5"].value, "Calc", wb_f, wb_v) or 0.0, round(20.0 / 7.0, 3))
+    assert math.isclose(_eval_simple_formula(ws["B6"].value, "Calc", wb_f, wb_v) or 0.0, 33.8)
+
+    # Circular reference workbook: direct self-ref and 2-node cycle
+    wb_cyc = openpyxl.Workbook()
+    ws_c = wb_cyc.active
+    ws_c.title = "Loop"
+    ws_c["A1"] = "=B1+1"
+    ws_c["B1"] = "=A1+1"
+    ws_c["C1"] = "=SUM(C1:C2)"
+    ws_c["C2"] = 5.0
+    cbuf = io.BytesIO()
+    wb_cyc.save(cbuf)
+
+    c_res = audit_workbook_bytes(cbuf.getvalue(), require_cached_formulas=False)
+    assert not c_res["ok"]
+    assert c_res["circular_references"] >= 1
+    assert any(d["item"] == "workbook_circular_references" for d in c_res["defects"])
+
+    wb_cf = openpyxl.load_workbook(io.BytesIO(cbuf.getvalue()), data_only=False)
+    wb_cv = openpyxl.load_workbook(io.BytesIO(cbuf.getvalue()), data_only=True)
+    circ_hits: list[str] = []
+    val = _eval_simple_formula(
+        "=B1+1", "Loop", wb_cf, wb_cv, visiting=frozenset({("Loop", 1, 1)}), circular_refs=circ_hits
+    )
+    assert val is None
+    assert circ_hits
+
+
+def test_ple_evidence_units_and_summary_markdown() -> None:
+    import math
+    import pytest
+
+    assert math.isclose(convert_unit(2.0, "in_wg", "Pa"), 498.1778, rel_tol=1e-6)
+    assert math.isclose(convert_unit(1.0, "in_w.g.", "Pa"), 249.0889, rel_tol=1e-6)
+    assert math.isclose(convert_unit(10.0, "ft_h2o", "Pa"), 29890.67, rel_tol=1e-6)
+    assert math.isclose(convert_unit(2.0, "bar", "kPa"), 200.0, rel_tol=1e-6)
+
+    assert math.isclose(convert_unit(100.0, "tr", "kW"), 351.685284, rel_tol=1e-6)
+    assert math.isclose(convert_unit(100.0, "ton_cooling", "ton_ref"), 100.0, rel_tol=1e-9)
+    assert math.isclose(convert_unit(50.0, "tons", "kW"), 175.842642, rel_tol=1e-6)
+    assert math.isclose(convert_unit(1000.0, "btuh", "mbh"), 1.0, rel_tol=1e-6)
+    assert math.isclose(convert_unit(1.0, "mmbtu/hr", "kW"), 293.07107, rel_tol=1e-6)
+    assert math.isclose(convert_unit(10.0, "hp", "kW"), 7.45699872, rel_tol=1e-6)
+
+    assert math.isclose(convert_unit(2.5, "klf", "kN/m"), 36.48475725, rel_tol=1e-6)
+    assert math.isclose(convert_unit(150.0, "pcf", "kg/m3"), 2402.76945, rel_tol=1e-6)
+    assert math.isclose(convert_unit(2.5, "MVA", "kVA"), 2500.0, rel_tol=1e-9)
+    assert math.isclose(convert_unit(500.0, "mcm", "mm2"), 253.3537395, rel_tol=1e-6)
+
+    with pytest.raises(ValueError):
+        convert_unit(100.0, "kVA", "kW")
+
+    ledger = EvidenceLedger()
+    ledger.record("static_pressure", 2.0, "in_wg", "M-101 rev A", revision="Rev A")
+    ledger.record("static_pressure", 2.5, "in_wg", "M-101 rev B", revision="Rev B", supersedes="M-101 rev A")
+    ledger.record("beam_load", 1.5, "klf", "S-201")
+    ledger.record("beam_load", 2.0, "klf", "S-202")
+    md = ledger.summary_markdown()
+    assert "static_pressure" in md
+    assert "1 superseded" in md
+    assert "Unresolved Conflicts" in md
+    assert "beam_load" in md

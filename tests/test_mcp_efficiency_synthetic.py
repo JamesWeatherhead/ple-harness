@@ -188,3 +188,70 @@ def test_264_tool_mcp_ondemand_vs_eager_reachability_and_token_reduction() -> No
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_small_catalog_direct_fast_path_threshold() -> None:
+    """Tests direct fast-path when <= direct_threshold (default 8) vs 4-tool ondemand when > threshold."""
+    small_1 = [{
+        "name": "secret_word",
+        "description": "Returns the secret word.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"prefix": {"type": "string", "description": "Optional prefix"}},
+            "required": [],
+            "additionalProperties": False,
+        },
+    }]
+    srv1, url1 = _start_mcp_server(small_1)
+    tools_8 = _build_264_tools()[:8]
+    srv8, url8 = _start_mcp_server(tools_8)
+    tools_9 = _build_264_tools()[:9]
+    srv9, url9 = _start_mcp_server(tools_9)
+    try:
+        async def run_check() -> None:
+            # 1 tool (<= 8): direct fast-path exposes apps__secret_word with full schema properties
+            sess1 = _HTTPMCPBridgeSession(url1)
+            sess1.mcp_servers = [{"name": "apps", "url": url1}]
+            cat1 = MCPCatalog(mode="ondemand", direct_threshold=8)
+            note1 = await cat1.connect(sess1)
+            exposed1 = cat1.exposed_tools()
+            assert len(exposed1) == 1
+            assert exposed1[0]["function"]["name"] == "apps__secret_word"
+            assert "prefix" in exposed1[0]["function"]["parameters"]["properties"]
+            assert exposed1[0]["function"]["parameters"].get("additionalProperties") is False
+            assert cat1.is_mcp_tool("apps__secret_word")
+            assert "await" in note1.lower() or "wait" in note1.lower()
+            direct_res = json.loads(await cat1.execute_tool("apps__secret_word", {"prefix": "X"}))
+            assert direct_res["executed"] == "secret_word"
+            assert direct_res["args"] == {"prefix": "X"}
+            assert cat1.stats()["effective_mode"] == "direct"
+
+            # 8 tools (<= 8): still uses direct fast-path
+            cat8 = MCPCatalog(mode="ondemand", direct_threshold=8)
+            await cat8.connect(_HTTPMCPBridgeSession(url8))
+            assert cat8.stats()["exposed_tools_count"] == 8
+            assert cat8.stats()["effective_mode"] == "direct"
+
+            # 9 tools (> 8): switches automatically to 4-tool paginated on-demand mode
+            cat9 = MCPCatalog(mode="ondemand", direct_threshold=8)
+            await cat9.connect(_HTTPMCPBridgeSession(url9))
+            assert cat9.stats()["exposed_tools_count"] == 4
+            assert cat9.stats()["effective_mode"] == "ondemand"
+            assert [t["function"]["name"] for t in cat9.exposed_tools()] == [
+                "mcp_list_servers",
+                "mcp_search_tools",
+                "mcp_get_tool_schema",
+                "mcp_call_tool",
+            ]
+
+            # direct_threshold=0 forces 4-tool ondemand even for 1 tool
+            cat0 = MCPCatalog(mode="ondemand", direct_threshold=0)
+            await cat0.connect(_HTTPMCPBridgeSession(url1))
+            assert cat0.stats()["exposed_tools_count"] == 4
+            assert cat0.stats()["effective_mode"] == "ondemand"
+
+        asyncio.run(run_check())
+    finally:
+        for s in (srv1, srv8, srv9):
+            s.shutdown()
+            s.server_close()
