@@ -8,7 +8,9 @@
 
 **Deterministic gate-survival agent harness for Google's [Physical-Engineering's Last Exam (PLE)](https://ple-bench.com/).**
 
-`ple-harness` pairs a single-coordinator WebSocket execution loop ([`serve.py`](serve.py) + [`harness.py`](harness.py)) with Turn-0 workspace reconnaissance, service-group indexed on-demand MCP discovery, `90,000`-token structured compaction, a unit-aware `EvidenceLedger`, milestone and sequential observation guards, and cold-read export auditors across `.xlsx`/`.xlsm`, `.zip`, `.ifc`, `.dxf`, `.pdf`, and `.docx`/`.md`.
+Most agent harnesses treat engineering failures as model reasoning deficits—assuming that shell access, eager tool schemas, and aggressive `50k` compaction suffice. Across 29 public dev tasks under locked Stage-2 `google-cloud/gpt-oss-120b` pricing (`$0.09/$0.36` per 1M tokens; `deepseek/deepseek-v4.1-flash` local judge), paired runs contradict that assumption: a competent starter baseline (`0.065`, `$0.033/task`, `1.1 min/task`) still drops `2/29` tasks empty (`27/29` usable), breaks Excel parsers (`parse_ok=False`), crashes IFC4 scripts (`ERR_EXEC`), collapses on 353-tool MCP portals, and thrashes under `50k` compaction.
+
+`ple-harness` ([`serve.py`](serve.py) + [`harness.py`](harness.py)) eliminates empty exports (**`29/29` usable**) and all parse/script crashes, fixes Cluster-A blind-MCP collapse (`0.015->0.118`), and lifts `google-cloud/gemini-3.8-flash` on `PROBE3` from **`0.000` (`0/3`) to `0.153` (`3/3`)**, while exposing an honest turn-budget inversion on `gpt-oss-120b` (`0.065->0.041`, `$0.065/task`, `1.6 min/task`) where `mc60` MCP-first gates protect structural exports at the expense of rubric-memo drafting turns (`0.113->0.067`).
 
 ---
 
@@ -28,38 +30,38 @@ flowchart LR
     INC -->|"done / 10s cancel drain"| EVAL
 ```
 
-### Core Safeguards & Implementation Symbols
+### Safeguards & Implementation Symbols
 
 | Failure Mode Targeted | `ple-harness` Mechanism | Key Symbols |
 |---|---|---|
-| **Early stops & empty exports** | Turn-0 `_workspace_recon()`, call/time milestone nudges (`ENABLE_MILESTONE_GUARD`), and missing-deliverable checks in `_pre_completion_gate` | [`harness.py`](harness.py): `_workspace_recon`, `_milestone_note`, `_pre_completion_gate` |
-| **353-tool MCP bloat & blind search** | Direct `<server>__<tool>` when `<= 8` tools; `-99.28%` 4-tool `ondemand` catalog (`62,370 -> 449 tok/req` on 264 tools) enriched with `service_groups()` counts and inline `parameters` schemas (`<= 8` search hits) | [`mcp_catalog.py`](mcp_catalog.py): `MCPCatalog`, `service_groups`, `search_tools`, `ONDEMAND_CORE_TOOLS` |
-| **Hallucinated premature writes** | Executes MCP calls first and defers same-batch or pre-MCP deliverable `write_file`/`edit_file` calls until MCP output is observed (`_wrote_after_mcp`) | [`harness.py`](harness.py): `EngineeringCoordinator.run`, `_pre_completion_gate` |
-| **Unit flips & revision conflicts** | `EvidenceLedger` normalizes `19` physical dimensions to SI (`tr`, `btuh`, `mbh`, `in_wg`, `ft_h2o`, `klf`, `pcf`, `kcmil`, `c*cm/w`, etc.) and enforces `supersedes` resolution | [`evidence.py`](evidence.py): `EvidenceLedger`, `UNIT_TABLE`, `normalize_unit`, `convert_unit` |
-| **Broken templates, IFC4, CAD, PDF & memos** | Cold-read export auditing over saved bytes via `session.read_file` with up to `MAX_VERIFY_REPAIRS="2"` automated repair cycles | [`verifiers/`](verifiers/__init__.py): `audit_workbook_bytes`, `audit_zip_deliverables`, `audit_ifc4_bytes`, `audit_dxf_bytes`, `audit_pdf_bytes`, `audit_decision_memo` |
-| **Compaction thrashing, timeout & API errors** | `90k` compaction keeping 12 recent outputs, `20 MiB` incumbent rollback, `RESERVE_VERIFY_SEC="150"` wrap-up, `CancelledError` durable summary rescue, and live `400` recovery (`drop_effort`, `drop_stream_options`, `marked()`, `thought_signature` preservation) | [`harness.py`](harness.py): `compact`, `finish`, `_snapshot_incumbent`, `marked`, `drop_thinking`, `drop_effort`; [`pricing.py`](pricing.py): `UsageTracker`, `LOCKED_RATES` |
+| **Early stops & empty exports (`2->0`)** | Turn-0 `_workspace_recon()` (`<=160` files, `<=5` XLSX schemas, solvers), milestone nudges (`ENABLE_MILESTONE_GUARD`), and missing-deliverable checks in `_pre_completion_gate` | [`harness.py`](harness.py): `_workspace_recon`, `_milestone_note`, `_pre_completion_gate` |
+| **353-tool MCP bloat & blind search** | Direct `<server>__<tool>` when `<=8` tools; `-99.28%` 4-tool `ondemand` catalog (`62,370->449 tok/req` on 264 tools) enriched with Turn-0 `service_groups()` counts and inline `parameters` schemas (`<=8` hits) | [`mcp_catalog.py`](mcp_catalog.py): `MCPCatalog`, `service_groups`, `search_tools`, `ONDEMAND_CORE_TOOLS` |
+| **Premature blind writes** | Executes MCP calls first and defers same-batch or pre-MCP deliverable `write_file`/`edit_file` calls until MCP output is observed (`_wrote_after_mcp`) | [`harness.py`](harness.py): `EngineeringCoordinator.run`, `_pre_completion_gate` |
+| **Unit flips & revision conflicts** | `EvidenceLedger` normalizes `19` physical dimensions to SI (`tr`, `btuh`, `mbh`, `in_wg`, `ft_h2o`, `klf`, `pcf`, `kcmil`, `c*cm/w`, etc.) and gates unresolved `supersedes` conflicts | [`evidence.py`](evidence.py): `EvidenceLedger`, `UNIT_TABLE`, `normalize_unit`, `convert_unit` |
+| **Broken templates, IFC4, DXF, PDF & memos** | Cold-read auditing over exported bytes via `session.read_file` with up to `MAX_VERIFY_REPAIRS="2"` repair turns | [`verifiers/`](verifiers/__init__.py): `audit_workbook_bytes`, `audit_zip_deliverables`, `audit_ifc4_bytes`, `audit_dxf_bytes`, `audit_pdf_bytes`, `audit_decision_memo` |
+| **50k thrashing, timeout & API errors** | `90k` compaction keeping `12` recent outputs, `20 MiB` incumbent rollback, `RESERVE_VERIFY_SEC="150"` (`min(150, left/4)`), `CancelledError` `_last_durable_summary` rescue, and `400` recovery (`drop_effort`, `drop_stream_options`, `marked()`, `thought_signature`) | [`harness.py`](harness.py): `compact`, `finish`, `_snapshot_incumbent`, `marked`, `drop_thinking`, `drop_effort`; [`pricing.py`](pricing.py): `UsageTracker`, `LOCKED_RATES` |
 
 ---
 
 ## Measured Dev-Set Results (29 Public Dev Tasks)
 
-All 29 public dev tasks were evaluated end-to-end against locked Stage-2 `google-cloud/gpt-oss-120b` pricing (`$0.09/$0.36` per 1M input/output tokens; local rubric scoring with `deepseek/deepseek-v4.1-flash` via OpenRouter).
+Evaluated end-to-end against locked Stage-2 `google-cloud/gpt-oss-120b` pricing (`$0.09/$0.36` per 1M input/output tokens; local rubric scoring via `deepseek/deepseek-v4.1-flash` on OpenRouter).
 
 ### 1. Paired 29-Task Comparison (`gpt-oss-120b`, `90k`, `medium`, `mc60`)
 
-| Metric / Slice | Starter Baseline (`ple-baseline-starter-capped`) | `ple-harness` v2.1 (Submitted) | Delta / Observed Shift |
+| Metric / Slice | Starter Baseline (`ple-baseline-starter-capped`) | `ple-harness` v2.1 (Submitted) | Observed Shift |
 |---|---:|---:|---|
-| **Overall Dev Mean (29 tasks)** | `0.065` (`27/29` usable, `2` empty) | `0.041` (**`29/29` usable, `0` empty**) | `-0.024` overall; **`100%` deliverable reliability** |
-| **Mean Stage-2 Cost & Runtime** | `$0.033/task` · `1.09 min/task` (`65.2 s`) | `$0.065/task` · `1.58 min/task` (`95.0 s`) | `+$0.032/task` for recon, MCP & cold-read checks |
-| **Structural (`n=4`)** | `0.034` (`3/4` usable) | **`0.036`** (`4/4` usable) | `roof-deck-design` `0.043 -> 0.057` (`prec 0.5 -> 1.0`); `eor-review` `empty -> 0.0055` |
-| **Civil (`n=9`)** | `0.097` (`8/9` usable) | `0.052` (`9/9` usable) | Eliminated `data-center-site-model` empty export |
-| **Electrical (`n=9`)** | `0.065` (`9/9` usable) | `0.041` (`9/9` usable) | `division-26` `parse_ok False -> True`; `lv-cable-sizing` `0.000 -> 0.003` |
-| **Mechanical (`n=7`)** | `0.040` (`7/7` usable) | `0.029` (`7/7` usable) | `data-hall-mep-routing` & `-offset` `ERR_EXEC -> ERR_VALIDATE` |
-| **By Grading: `checks` (`12`) / `checks-judge` (`3`) / `rubric` (`14`)** | `0.025` / `0.000` / `0.113` | `0.020` / **`0.003`** / `0.067` | Structured `checks-judge` lifted; `rubric` memos suffered turn-budget inversion |
+| **Overall Dev Mean (29 tasks)** | `0.065` (`27/29` usable, `2` empty) | `0.041` (**`29/29` usable, `0` empty**) | `-0.024` mean; **`100%` deliverable reliability** |
+| **Mean Stage-2 Cost & Runtime** | `$0.033/task` · `1.09 min/task` (`65.2 s`) | `$0.065/task` · `1.58 min/task` (`95.0 s`) | `+$0.032/task` for recon, MCP & cold-read verification |
+| **Structural (`n=4`)** | `0.034` (`3/4` usable) | **`0.036`** (`4/4` usable) | `roof-deck-design` `0.043->0.057` (`prec 0.50->1.00`); `eor-review` `empty->0.0055` |
+| **Civil (`n=9`)** | `0.097` (`8/9` usable) | `0.052` (`9/9` usable) | Rescued `data-center-site-model` empty export |
+| **Electrical (`n=9`)** | `0.065` (`9/9` usable) | `0.041` (`9/9` usable) | `division-26` `parse_ok False->True`; `lv-cable-sizing` `0.000->0.003` |
+| **Mechanical (`n=7`)** | `0.040` (`7/7` usable) | `0.029` (`7/7` usable) | `data-hall-mep-routing` & `-offset` `ERR_EXEC->ERR_VALIDATE` (`valid=1.0`) |
+| **Grading: `checks` (`12`) / `checks-judge` (`3`) / `rubric` (`14`)** | `0.025` / `0.000` / `0.113` | `0.020` / **`0.003`** / `0.067` | Structured `checks-judge` lifted; `rubric` memos hit turn-budget inversion |
 
-### 2. Controlled Ablations (Subset-Scoped)
+### 2. Controlled Ablations (Subset-Scoped, Zero Extrapolation)
 
-| Ablation Config (Scope) | Mean Score | Usable | Mean Stage-2 $/task | Mean Runtime |
+| Ablation Config (Scope) | Mean Score | Usable | Stage-2 $/task | Mean Runtime |
 |---|---:|---:|---:|---:|
 | `SCR5_FAST` (5 checks tasks): Baseline | `0.009` | `4/5` | `$0.008` | `25.6 s` |
 | `SCR5_FAST`: `+MCP Catalog Only` | `0.006` | `5/5` | `$0.043` | `61.4 s` |
@@ -74,15 +76,17 @@ All 29 public dev tasks were evaluated end-to-end against locked Stage-2 `google
 
 ### 3. Cross-Model Generalizability
 
-| Model (`google-cloud/*`) & Scope | Config | Score | Usable | Mean Tokens (`In / Cache / Out`) | Stage-2 $/task |
-|---|---|---:|---:|---|---:|
-| `gpt-oss-120b` (`29` tasks) | Baseline vs. **v2.1 (Submitted)** | `0.065 -> 0.041` | `27/29 -> 29/29` | `347k/244k/5.9k -> 684k/588k/8.8k` | `$0.033 -> $0.065` |
-| `gpt-oss-120b` (`PROBE3`, n=3) | Baseline vs. v2.1 | `0.014 -> 0.019` | `3/3 -> 3/3` | `107k/83k/6.6k -> 682k/642k/5.6k` | `$0.012 -> $0.063` |
-| `gemini-3.8-flash` (`PROBE3`, n=3) | Baseline vs. v2 | `0.000 ->` **`0.153`** | `0/3 ->` **`3/3`** | `1.15M/923k/20.2k -> 1.63M/1.34M/35.1k` | `$0.634 -> $0.894` |
-| `gemini-3.8-flash` (`roof-deck`, n=1) | v2.1 (`BUDGET_CAP_USD=0.32`) | `0.000` | `0/1` | `788k / 675k / 7.3k` | `$0.326` (cap hit) |
-| `gemma-4-26b` (`PROBE3`, n=3) | Baseline vs. v2 | `0.000 -> 0.000` | `1/3 -> 1/3` | `1.67M/1.46M/26.2k -> 1.43M/1.29M/21.8k` | `$0.069 -> $0.052` |
-| `llama-4-maverick` (`PROBE3`, n=3) | Baseline vs. v2.1 | `0.000 -> 0.000` | `0/3 -> 0/3` | `4.2k/0.3k/1.7k -> 154k/126k/12.1k` | `$0.003 -> $0.068` |
-| `gemini-4-neon` (`roof-deck`, n=1) | v2.1 (`BUDGET_CAP_USD=0.85`) | `0.000` | `0/1` | `622k / 473k / 29.2k` | `$0.957` (cap hit post-FEA) |
+Prompt caching (`82–94%` across `PROBE3`; `86.0%` on 29-task `gpt-oss-120b`) and Turn-0 schemas benefit every tool-compliant model, whereas repair loops and FEA synthesis selectively unlock high-capacity reasoners—and tight spend caps (`$0.32`/`$0.85`) induce discontinuous `0.000` cliffs mid-solve:
+
+| model_api | Baseline | Yours | Delta | Tokens in/out/cached | $/task |
+|---|---:|---:|---:|---:|---:|
+| `google-cloud/gpt-oss-120b` (`Full 29`) | `0.065 (27/29)` | `0.041 (29/29)` | `-0.024 (+2 usable)` | `684k/8.8k/588k` *(Base: 347k/5.9k/244k)* | `$0.033 -> $0.065` |
+| `google-cloud/gpt-oss-120b` (`PROBE3`, n=3) | `0.014 (3/3)` | `0.019 (3/3)` | `+0.005` | `682k/5.6k/642k` *(Base: 107k/6.6k/83k)* | `$0.012 -> $0.063` |
+| `google-cloud/gemini-3.8-flash` (`PROBE3`, n=3) | `0.000 (0/3)` | **`0.153 (3/3)`** | **`+0.153 (+3 usable)`** | `1.63M/35.1k/1.34M` *(Base: 1.15M/20.2k/923k)* | `$0.634 -> $0.894` |
+| `google-cloud/gemini-3.8-flash` (`roof`, n=1, `$0.32` cap) | `—` | `0.000 (0/1)` | `cap cliff` | `788k/7.3k/675k` | `$0.326` (cap hit) |
+| `google-cloud/gemma-4-26b` (`PROBE3`, n=3) | `0.000 (1/3)` | `0.000 (1/3)` | `0.000 (-29.5% s)` | `1.43M/21.8k/1.29M` *(Base: 1.67M/26.2k/1.46M)* | `$0.069 -> $0.052` |
+| `google-cloud/llama-4-maverick` (`PROBE3`, n=3) | `0.000 (0/3)` | `0.000 (0/3)` | `0.000 (tool fail)` | `154k/12.1k/126k` *(Base: 4.2k/1.7k/0.3k)* | `$0.003 -> $0.068` |
+| `google-cloud/gemini-4-neon` (`roof`, n=1, `$0.85` cap) | `—` | `0.000 (0/1)` | `cap cliff (FEA)` | `622k/29.2k/473k` | `$0.957` (cap hit) |
 
 ---
 
@@ -92,7 +96,7 @@ All 29 public dev tasks were evaluated end-to-end against locked Stage-2 `google
 
 ```bash
 uv run --with pytest --with-requirements requirements.txt python -m pytest -q
-# -> 34 passed, 7 warnings in 19.77s (upstream ezdxf PyparsingDeprecationWarning)
+# -> 34 passed, 7 warnings in 18.74s (upstream ezdxf PyparsingDeprecationWarning)
 ```
 
 | Test Module | Tests | Coverage |
@@ -100,13 +104,13 @@ uv run --with pytest --with-requirements requirements.txt python -m pytest -q
 | [`tests/test_cad_pdf_synthetic.py`](tests/test_cad_pdf_synthetic.py) | `5` | DXF `latin-1` decode, `NaN`/degenerate entities, PDF placeholders/blank pages, `_run_audit_internal` wiring |
 | [`tests/test_decision_memo_synthetic.py`](tests/test_decision_memo_synthetic.py) | `3` | `DOCX`/`MD` PTO prerequisite flips, work-package mismatches, future effective-date checks |
 | [`tests/test_geometry_ifc_synthetic.py`](tests/test_geometry_ifc_synthetic.py) | `3` | 2D viewport similarity calibration, STEP IFC4 cross/self clashes, forbidden zones, translation invariance |
-| [`tests/test_mcp_efficiency_synthetic.py`](tests/test_mcp_efficiency_synthetic.py) | `2` | 264-tool HTTP MCP benchmark (`62,370 -> 449 tok/req`, `-99.28%`, `264/264` reachable) & `<= 8` direct routing |
+| [`tests/test_mcp_efficiency_synthetic.py`](tests/test_mcp_efficiency_synthetic.py) | `2` | 264-tool HTTP MCP benchmark (`62,370->449 tok/req`, `-99.28%`, `264/264` reachable) & `<=8` direct routing |
 | [`tests/test_mv_workbook_synthetic.py`](tests/test_mv_workbook_synthetic.py) | `6` | Workbook & ZIP audit, circular reference detection, formula evaluation, incumbent rollback, `EvidenceLedger` SI conversions |
 | [`tests/test_protocol_e2e.py`](tests/test_protocol_e2e.py) | `15` | Live `serve.py` WebSocket loop: `429`/`500` retries, `400` fallbacks, budget cap, `cancel`, MCP deferral, recon, `service_groups` |
 
 ### Competition Kit Validation & OpenRouter Local Proxy
 
-Run from a checkout of [`google-research/ple`](https://github.com/google-research/ple) (set `DOCKER_DEFAULT_PLATFORM=linux/amd64` on Apple Silicon per Thread `#761085`):
+Run from a checkout of [`google-research/ple`](https://github.com/google-research/ple) against the committed `main` HEAD (`git -C ../ple-harness rev-parse HEAD`) (set `DOCKER_DEFAULT_PLATFORM=linux/amd64` on Apple Silicon per Thread `#761085`):
 
 ```bash
 export DOCKER_DEFAULT_PLATFORM=linux/amd64
@@ -117,8 +121,9 @@ uv run python -m kit validate ../ple-harness
 
 # 2. Container build, egress proxy, model & listen check
 uv run python -m kit check ../ple-harness --no-smoke --env-file openrouter.env
-# -> submission.yaml: pass | build: pass (193 MiB) | model: pass (gpt-oss 120B in 0.8s)
-#    listen: pass (websocket accepted 3s) | smoke: skip | artifacts: 29 of 29 dev tasks usable
+# -> submission.yaml: pass | files: pass (26 files) | build: pass (193 MiB, 33 s)
+#    model: pass (gpt-oss 120B in 1.6 s) | listen: pass (3 s) | smoke: skip
+#    artifacts: 29 of 29 dev tasks usable
 
 # 3. Verify unpacked 29-task dev artifacts
 uv run python -m kit artifacts ../ple-harness
@@ -129,7 +134,7 @@ export HF_TOKEN=<your_hf_read_token>
 uv run python eval/run.py ../ple-harness --env-file openrouter.env
 ```
 
-To reproduce local evaluation without Google Cloud Vertex AI credentials, run a local OpenAI-compatible HTTP proxy on `0.0.0.0:4000` translating `google-cloud/<id>` (e.g., `google-cloud/gpt-oss-120b` -> `openai/gpt-oss-120b`) to OpenRouter, and set `MODEL_PROXY_URL=http://localhost:4000`, `MODEL_PROXY_KEY`, `MODEL_API_KEY`, `JUDGE_BASE_URL`, `JUDGE_API_KEY`, and `JUDGE_MODEL=deepseek/deepseek-v4.1-flash` in `openrouter.env`.
+Local evaluation routed `google-cloud/<id>` (e.g., `google-cloud/gpt-oss-120b -> openai/gpt-oss-120b`) through an OpenAI-compatible HTTP proxy (`0.0.0.0:4000`, `MODEL_PROXY_URL=http://localhost:4000` via `--env-file openrouter.env`) to OpenRouter (`$59.25` of `$60.00` credits used across sweeps; Stage-2 USD computed via [`pricing.py`](pricing.py)), with `JUDGE_MODEL=deepseek/deepseek-v4.1-flash`. Four Cluster-A upstream files (`backfeed-energization-reply`, `permission-to-operate-memo`, `pre-application-capacity-response`, `solar-witness-test-package`) emit benign `wiki_dump.sql` key-pattern warnings while passing `kit artifacts` (`29 of 29 dev tasks usable`).
 
 ---
 
@@ -138,7 +143,7 @@ To reproduce local evaluation without Google Cloud Vertex AI credentials, run a 
 - [`submission.yaml`](submission.yaml) — Container build/serve manifest (`model_api: google-cloud/gpt-oss-120b`) and environment flags.
 - [`serve.py`](serve.py) — Thin WebSocket entrypoint invoking `taskbridge.run(solve)`.
 - [`harness.py`](harness.py) — `EngineeringCoordinator`, `RuntimeConfig`, Turn-0 recon, `90k` compaction, milestone guard, sequential MCP deferral, `_pre_completion_gate`, and timeout/cancel/incumbent recovery.
-- [`mcp_catalog.py`](mcp_catalog.py) — Adaptive Streamable-HTTP `MCPCatalog` (`direct` fast-path `<= 8` tools; `service_groups()`-indexed 4-tool `ondemand` catalog with inline search schemas above `8` tools).
+- [`mcp_catalog.py`](mcp_catalog.py) — Adaptive Streamable-HTTP `MCPCatalog` (`direct` fast-path `<=8` tools; `service_groups()`-indexed 4-tool `ondemand` catalog with inline search schemas above `8` tools).
 - [`evidence.py`](evidence.py) — `EvidenceLedger` (`19` canonical SI dimensions, `supersedes` conflict resolution).
 - [`verifiers/`](verifiers/__init__.py) — Cold-read binary auditors ([`workbook_audit.py`](verifiers/workbook_audit.py), [`geometry_ifc_audit.py`](verifiers/geometry_ifc_audit.py), [`decision_memo_audit.py`](verifiers/decision_memo_audit.py), [`cad_pdf_audit.py`](verifiers/cad_pdf_audit.py)).
 - [`pricing.py`](pricing.py) — Locked Kaggle Stage-2 model pricing (`LOCKED_RATES`, `#761530`) and `UsageTracker`.
