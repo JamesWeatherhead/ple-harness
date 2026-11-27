@@ -115,8 +115,11 @@ async def _run_eval_session(
     mcp_servers: list[dict[str, Any]] | None = None,
     cancel_after_sec: float | None = None,
     timeout_sec: float = 30.0,
+    initial_files: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
     fs: dict[str, bytes] = {"/workspace/input.txt": b"13.8 kV test input\n"}
+    if initial_files:
+        fs.update(initial_files)
     usages: list[dict] = []
     execs: list[str] = []
     writes: list[str] = []
@@ -650,3 +653,553 @@ def test_stage2_claude_marked_gemini_signatures_and_audit_wiring(monkeypatch: An
     assert any(d["item"] == "pdf_empty_text" for d in pdf_res["defects"])
     assert harness._as_bool("false") is False
     assert harness._as_bool("true") is True
+
+
+def test_e2e_effort_backoff_milestone_guard_and_budget_warn() -> None:
+    """Tests max->high effort backoff on empty length cutoff, milestone guard at call 10, and call budget warning."""
+    seen_efforts: list[str | None] = []
+    seen_milestone: list[bool] = []
+    seen_budget_warn: list[bool] = []
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        seen_efforts.append(body.get("reasoning_effort"))
+        all_txt = "\n".join(str(m.get("content") or "") for m in (body.get("messages") or []))
+        seen_milestone.append("MILESTONE" in all_txt)
+        seen_budget_warn.append("CALL BUDGET WARNING" in all_txt or "remaining" in all_txt.lower())
+        if idx == 0:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "reasoning": "thinking hit output token ceiling..."}),
+                _sse_chunk({}, finish_reason="length", usage={"prompt_tokens": 40, "completion_tokens": 50}),
+            ])
+        elif idx < 10:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": f"call_work_{idx}",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": json.dumps({"path": f"/workspace/work/s{idx}.py", "content": "pass"})},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+        elif idx == 10:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_deliv",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": '{"path":"/workspace/output/report.md","content":"# Report\\nVerified result.\\n"}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+        else:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Verified output/report.md."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+
+    port = _free_port()
+    with _MockOpenAIServer(handle) as oai:
+        proc = _launch_serve(port, oai.url, {"REASONING_EFFORT": "max", "MAX_MODEL_CALLS": "13"})
+        try:
+            _wait_tcp(port, timeout=15.0)
+            res = asyncio.run(_run_eval_session(f"ws://127.0.0.1:{port}", "Write /workspace/output/report.md"))
+            assert res["done"]["type"] == "done"
+            assert seen_efforts[0] == "max"
+            assert seen_efforts[1] == "high"
+            assert any(seen_milestone), "Expected HARNESS MILESTONE injection at call 10 while only work/*.py existed"
+            assert any(seen_budget_warn), "Expected CALL BUDGET WARNING near MAX_MODEL_CALLS"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_e2e_low_effort_drops_reasoning_and_rejects_dsml_leak() -> None:
+    """Tests that low->None effort backoff occurs on hidden length cutoff and raw DSML XML is nudged back."""
+    seen_payloads: list[dict] = []
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        seen_payloads.append(body)
+        if idx == 0:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "reasoning": "low effort still truncated..."}),
+                _sse_chunk({}, finish_reason="length", usage={"prompt_tokens": 30, "completion_tokens": 50}),
+            ])
+        elif idx == 1:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": '<｜DSML｜ calls>\n<｜DSML｜ invoke name="bash">'}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 40, "completion_tokens": 20}),
+            ])
+        elif idx == 2:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_dsml_rec",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": '{"path":"/workspace/out.txt","content":"clean"}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+        else:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Wrote /workspace/out.txt cleanly."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 50, "completion_tokens": 10}),
+            ])
+
+    port = _free_port()
+    with _MockOpenAIServer(handle) as oai:
+        proc = _launch_serve(port, oai.url, {"REASONING_EFFORT": "low"})
+        try:
+            _wait_tcp(port, timeout=15.0)
+            res = asyncio.run(_run_eval_session(f"ws://127.0.0.1:{port}", "Write /workspace/out.txt"))
+            assert len(seen_payloads) == 4
+            assert seen_payloads[0].get("reasoning_effort") == "low"
+            assert "reasoning_effort" not in seen_payloads[1]
+            assert res["fs"]["/workspace/out.txt"] == b"clean"
+            assert "Wrote /workspace/out.txt cleanly." in res["done"]["final_message"]
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_e2e_run_export_audit_mismatched_docx_as_workbook_no_crash() -> None:
+    """Tests that run_export_audit(audit_kind='workbook') on .docx returns ok=False without crashing."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", "<w:document/>")
+    docx_bytes = buf.getvalue()
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        if idx == 0:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_docx_as_wb",
+                        "type": "function",
+                        "function": {
+                            "name": "run_export_audit",
+                            "arguments": '{"path":"/workspace/study.docx","audit_kind":"workbook"}',
+                        },
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+        elif idx == 1:
+            msgs = body.get("messages") or []
+            tool_res = [json.loads(m["content"].splitlines()[0]) for m in msgs if m.get("role") == "tool"]
+            assert len(tool_res) == 1
+            assert tool_res[0]["ok"] is False and "not an Excel workbook" in tool_res[0]["error"]
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_recover_docx",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": '{"path":"/workspace/recovered.txt","content":"survived"}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 60, "completion_tokens": 15}),
+            ])
+        else:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Recovered after docx audit mismatch."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 70, "completion_tokens": 10}),
+            ])
+
+    port = _free_port()
+    with _MockOpenAIServer(handle) as oai:
+        proc = _launch_serve(port, oai.url)
+        try:
+            _wait_tcp(port, timeout=15.0)
+            res = asyncio.run(
+                _run_eval_session(
+                    f"ws://127.0.0.1:{port}",
+                    "Audit docx file",
+                    initial_files={"/workspace/study.docx": docx_bytes},
+                )
+            )
+            assert res["done"]["type"] == "done"
+            assert res["fs"]["/workspace/recovered.txt"] == b"survived"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_e2e_run_export_audit_corrupt_xlsx_no_crash() -> None:
+    """Tests that run_export_audit on a corrupt .xlsx returns ok=False without crashing run_tool."""
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        if idx == 0:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_bad_xlsx",
+                        "type": "function",
+                        "function": {
+                            "name": "run_export_audit",
+                            "arguments": '{"path":"/workspace/corrupt.xlsx","audit_kind":"workbook"}',
+                        },
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+        elif idx == 1:
+            msgs = body.get("messages") or []
+            tool_res = [json.loads(m["content"].splitlines()[0]) for m in msgs if m.get("role") == "tool"]
+            assert len(tool_res) == 1
+            assert tool_res[0]["ok"] is False
+            assert tool_res[0].get("error") or tool_res[0].get("defects")
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_recover_xlsx",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": '{"path":"/workspace/fixed.txt","content":"ok"}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 60, "completion_tokens": 15}),
+            ])
+        else:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Recovered after corrupt xlsx."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 70, "completion_tokens": 10}),
+            ])
+
+    port = _free_port()
+    with _MockOpenAIServer(handle) as oai:
+        proc = _launch_serve(port, oai.url)
+        try:
+            _wait_tcp(port, timeout=15.0)
+            res = asyncio.run(
+                _run_eval_session(
+                    f"ws://127.0.0.1:{port}",
+                    "Audit corrupt xlsx",
+                    initial_files={"/workspace/corrupt.xlsx": b"not-a-zip-xlsx"},
+                )
+            )
+            assert res["done"]["type"] == "done"
+            assert res["fs"]["/workspace/fixed.txt"] == b"ok"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_template_schema_mismatch_and_docx_only_zip() -> None:
+    """Tests template_schemas missing column/sheet detection and require_xlsx=False for DOCX-only ZIPs."""
+    import io
+    import zipfile
+    import openpyxl
+
+    sys.path.insert(0, str(ROOT))
+    from verifiers.workbook_audit import audit_workbook_bytes, audit_zip_deliverables
+
+    wb = openpyxl.Workbook()
+    ws_items = wb.active
+    ws_items.title = "Items"
+    ws_items.append(["item_id", "total_project_cost_usd"])
+    ws_items.append(["C01", 1000.0])
+    ws_seg = wb.create_sheet("Segments")
+    ws_seg.append(["seg_id", "length_ft"])
+    ws_seg.append(["S1", 100])
+    buf_xlsx = io.BytesIO()
+    wb.save(buf_xlsx)
+    xlsx_bytes = buf_xlsx.getvalue()
+
+    tmpl = {
+        "templates/conveyance_study_TEMPLATE.xlsx": {
+            "Items": ["item_id", "total_project_cost_usd"],
+            "Segments": ["seg_id", "length_ft", "reinforced", "soil_type", "protective_system", "slope_h_per_v"],
+            "Alternatives": ["item_id"],
+        }
+    }
+    res_wb = audit_workbook_bytes(xlsx_bytes, template_schemas=tmpl)
+    assert res_wb["ok"] is False
+    items = {d["item"] for d in res_wb["defects"]}
+    assert "template_missing_sheet:Alternatives" in items
+    assert "template_missing_columns:Segments" in items
+
+    # DOCX-only ZIP passes cleanly with require_xlsx=False
+    buf_docx = io.BytesIO()
+    with zipfile.ZipFile(buf_docx, "w") as zf_doc:
+        zf_doc.writestr("[Content_Types].xml", "<Types/>")
+        zf_doc.writestr("word/document.xml", "<w:document><w:body><w:p><w:r><w:t>Division 26 Spec</w:t></w:r></w:p></w:body></w:document>")
+    buf_zip = io.BytesIO()
+    with zipfile.ZipFile(buf_zip, "w") as zf_out:
+        zf_out.writestr("specs/26_05_13.docx", buf_docx.getvalue())
+    res_zip = audit_zip_deliverables(buf_zip.getvalue(), require_xlsx=False, template_schemas=tmpl)
+    assert res_zip["ok"] is True
+
+
+def test_bash_ignores_readonly_inputs_and_memo_does_not_force_pto_sections(monkeypatch: Any) -> None:
+    """Tests that _tool_bash skips read-only input paths and validation_memo.docx skips PTO section checks."""
+    import io
+    import zipfile
+
+    sys.path.insert(0, str(ROOT))
+    import harness
+
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    cfg = harness.RuntimeConfig.from_env()
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", "<w:document><w:body><w:p><w:r><w:t>E119 validation test summary.</w:t></w:r></w:p></w:body></w:document>")
+    memo_docx = buf.getvalue()
+
+    class _DummySession:
+        workdir = "/workspace"
+        mcp_servers: list[dict] = []
+        limits: dict = {}
+        final_message = ""
+        def time_left(self) -> None:
+            return None
+        async def log(self, text: str) -> None:
+            return None
+        async def exec(self, command: str, timeout_sec: int = 120) -> dict[str, Any]:
+            return {"exit_code": 0, "output": "inspected specs/DC-02_Mechanical_Design_Criteria_Memorandum_Rev3.docx", "timed_out": False}
+        async def read_file(self, path: str) -> bytes:
+            return memo_docx
+
+    coord = harness.EngineeringCoordinator(_DummySession(), config=cfg)
+    coord._initial_files.add("/workspace/existing_note.md")
+    asyncio.run(coord._tool_bash("python3 read.py > specs/DC-02_Mechanical_Design_Criteria_Memorandum_Rev3.docx"))
+    asyncio.run(coord._tool_bash("cat existing_note.md > existing_note.md"))
+    assert "/workspace/specs/DC-02_Mechanical_Design_Criteria_Memorandum_Rev3.docx" not in coord.touched_deliverables
+    assert "/workspace/existing_note.md" not in coord.touched_deliverables
+
+    res_memo = asyncio.run(coord._run_audit_internal("/workspace/output/E119_validation_memo.docx"))
+    assert res_memo["ok"] is True
+
+
+def test_workspace_recon_injects_brief_and_fires_oneshot_unread_spec_gate(monkeypatch: Any) -> None:
+    """Tests ENABLE_WORKSPACE_RECON parses Turn-0 payload, injects brief/schemas, and gates unread specs once."""
+    sys.path.insert(0, str(ROOT))
+    import harness
+    import openai
+
+    recon_payload = {
+        "total_files": 4,
+        "files": [
+            {"path": "templates/conveyance_study_TEMPLATE.xlsx", "size": 4096},
+            {"path": "criteria/design_criteria.pdf", "size": 2048},
+            {"path": "specs/utility_spec.docx", "size": 1024},
+        ],
+        "templates": [{
+            "path": "templates/conveyance_study_TEMPLATE.xlsx",
+            "sheets": {"Segments": {"rows": 5, "headers": ["seg_id", "soil_type"], "col_a_samples": ["S1"]}},
+        }],
+        "json_schemas": [],
+        "spec_files": ["criteria/design_criteria.pdf", "specs/utility_spec.docx"],
+        "packages": {"openpyxl": True, "ifcopenshell": False},
+    }
+    seen_prompts: list[str] = []
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        msgs = body.get("messages") or []
+        seen_prompts.append(json.dumps(msgs))
+        if idx == 0:
+            # First turn: write output without reading any spec files -> should trigger unread-spec gate once
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_w",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": '{"path":"/workspace/output/out.md","content":"draft"}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+        elif idx == 1:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Done without reading specs."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 60, "completion_tokens": 10}),
+            ])
+        elif idx == 2:
+            # After gate asks to read specs, read one via read_file
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_r",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"/workspace/specs/utility_spec.docx"}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 70, "completion_tokens": 10}),
+            ])
+        else:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Verified after reading specs."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 80, "completion_tokens": 10}),
+            ])
+
+    class _ReconSession:
+        workdir = "/workspace"
+        instruction = "Complete task using templates and specs."
+        mcp_servers: list[dict] = []
+        limits: dict = {"exec_timeout_sec": 60}
+        final_message = ""
+        fs: dict[str, bytes] = {"/workspace/specs/utility_spec.docx": b"Voltage limit 13.8kV"}
+        def time_left(self) -> float:
+            return 1000.0
+        async def log(self, text: str) -> None:
+            return None
+        async def usage(self, model: str, i: int, o: int, c: int) -> None:
+            return None
+        async def exec(self, command: str, timeout_sec: int = 120) -> dict[str, Any]:
+            return {"exit_code": 0, "output": f"===RECON_START===\n{json.dumps(recon_payload)}\n===RECON_END===", "timed_out": False}
+        async def read_file(self, path: str) -> bytes:
+            return self.fs[path]
+        async def write_file(self, path: str, content: str | bytes, append: bool = False) -> int:
+            raw = content.encode() if isinstance(content, str) else content
+            self.fs[path] = raw
+            return len(raw)
+
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("ENABLE_WORKSPACE_RECON", "true")
+    monkeypatch.setenv("MODEL_NAME", "openai/gpt-oss-120b")
+    with _MockOpenAIServer(handle) as oai:
+        cfg = harness.RuntimeConfig.from_env()
+        client = openai.AsyncOpenAI(base_url=oai.url, api_key="test-key")
+        coord = harness.EngineeringCoordinator(_ReconSession(), config=cfg, client=client)
+        final_out = asyncio.run(coord.run())
+        assert "Verified after reading specs." in final_out
+        assert "[WORKSPACE BRIEF" in seen_prompts[0]
+        assert "soil_type" in seen_prompts[0]
+        assert coord._template_schemas["templates/conveyance_study_TEMPLATE.xlsx"]["Segments"] == ["seg_id", "soil_type"]
+        assert coord._spec_gate_fired is True
+        assert coord._spec_reads_seen is True
+        assert "No project spec/criteria documents" in seen_prompts[2]
+
+
+def _make_multiservice_mcp_session() -> Any:
+    """Builds an in-process fake MCP session exposing 12 tools across multiple Cluster-A groups."""
+    tools = [
+        {
+            "name": "openproject_mcp_list_projects",
+            "description": "List OpenProject projects.",
+            "inputSchema": {"type": "object", "properties": {"offset": {"type": "integer"}}, "required": []},
+        },
+        {
+            "name": "openproject_mcp_create_work_package",
+            "description": "Create an OpenProject work package for case tracking.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project_id": {"type": "integer"}, "subject": {"type": "string"}},
+                "required": ["project_id", "subject"],
+            },
+        },
+        {"name": "mail_list_messages", "description": "List mailbox messages.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
+        {"name": "mail_send_message", "description": "Send email message.", "inputSchema": {"type": "object", "properties": {"to": {"type": "string"}}}},
+        {"name": "wiki_js_mcp_search_pages", "description": "Search Wiki.js pages.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}},
+        {"name": "wiki_js_mcp_get_page", "description": "Read a Wiki.js page.", "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}}}},
+        {"name": "calendar_v2_list_events", "description": "List calendar events.", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "calendar_v2_create_event", "description": "Create calendar event.", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "mysql_execute_sql", "description": "Execute SQL query.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}}},
+        {"name": "nextcloud_mcp_list_files", "description": "List Nextcloud files.", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "excel_v2_read", "description": "Read workbook.", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "word_v2_create_document", "description": "Create docx document.", "inputSchema": {"type": "object", "properties": {}}},
+    ]
+
+    class _FakeMCPSession:
+        workdir = "/filesystem"
+        instruction = "Prepare the interconnection response memo and close case tracking."
+        mcp_servers = [{"name": "apps", "url": "http://127.0.0.1:8000/mcp/"}]
+        limits = {"exec_timeout_sec": 60}
+        final_message = ""
+
+        def time_left(self) -> float:
+            return 1000.0
+
+        async def log(self, text: str) -> None:
+            return None
+
+        async def usage(self, model: str, i: int, o: int, c: int) -> None:
+            return None
+
+        async def http(self, url: str, method: str = "POST", headers=None, body: bytes = b"", timeout_sec: int = 30) -> dict:
+            msg = json.loads(body.decode("utf-8"))
+            method_name = msg.get("method")
+            msg_id = msg.get("id")
+            if msg_id is None:
+                return {"status": 202, "headers": {}, "body": b""}
+            if method_name == "initialize":
+                result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+            elif method_name == "tools/list":
+                result = {"tools": tools}
+            else:
+                result = {}
+            payload = json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}).encode("utf-8")
+            return {"status": 200, "headers": {"content-type": "application/json"}, "body": payload}
+
+    return _FakeMCPSession()
+
+
+def test_ondemand_catalog_surfaces_service_groups_and_inline_schemas() -> None:
+    """Tests that on-demand MCP discovery indexes service groups and returns argument schemas on search."""
+    from mcp_catalog import MCPCatalog
+
+    sess = _make_multiservice_mcp_session()
+    cat = MCPCatalog(mode="ondemand", direct_threshold=8)
+    prompt = asyncio.run(cat.connect(sess))
+    assert "Available MCP service groups:" in prompt
+    for grp in ("openproject_mcp", "mail", "wiki_js_mcp"):
+        assert grp in prompt
+    listed = json.loads(cat.list_servers())
+    assert listed["service_groups"]["openproject_mcp"] == 2
+    assert listed["service_groups"]["mail"] == 2
+    assert listed["service_groups"]["wiki_js_mcp"] == 2
+    searched = json.loads(cat.search_tools("openproject"))
+    assert len(searched["matches"]) == 2
+    create_entry = next(m for m in searched["matches"] if m["tool"].endswith("create_work_package"))
+    assert create_entry["required_args"] == ["project_id", "subject"]
+    assert set(create_entry["arg_names"]) == {"project_id", "subject"}
+    assert "parameters" in create_entry
+    assert create_entry["parameters"]["required"] == ["project_id", "subject"]
+
+
+def test_pre_completion_gate_surfaces_both_mcp_groups_and_missing_deliverable(monkeypatch) -> None:
+    """Tests that zero-MCP and empty-deliverable checks fire simultaneously with service-group hints."""
+    import harness
+    import openai
+
+    sess = _make_multiservice_mcp_session()
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_NAME", "google-cloud/gpt-oss-120b")
+    cfg = harness.RuntimeConfig.from_env()
+    client = openai.AsyncOpenAI(base_url="http://127.0.0.1:9/v1", api_key="test-key")
+    coord = harness.EngineeringCoordinator(sess, config=cfg, client=client)
+    asyncio.run(coord.catalog.connect(sess))
+    assert len(coord.catalog.registry) == 12
+    assert coord.catalog.successful_calls == 0
+
+    gate_msg = asyncio.run(coord._pre_completion_gate("Summary claiming memo written."))
+    assert gate_msg is not None
+    assert "Connected MCP services (" in gate_msg
+    assert "openproject_mcp" in gate_msg
+    assert "mail" in gate_msg
+    assert "No deliverable file has been written on disk yet" in gate_msg
+

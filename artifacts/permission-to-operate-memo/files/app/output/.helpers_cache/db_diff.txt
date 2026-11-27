@@ -1,0 +1,74 @@
+<database_changes>
+=== DATABASE CHANGES SUMMARY ===
+Total rows added: 7
+Total rows deleted: 0
+Total rows modified: 2
+
+2 JSON file(s) excluded from this diff (not application state):
+  .apps_data/.coordinator/checkpoint_observations/physical_time.json: not application state
+  .apps_data/.coordinator/config/config.json: not application state
+
+Tables with changes (8):
+  .apps_data/openproject/openproject_dump.sql:journals: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:sessions: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:settings: +1 added, -0 deleted, ~1 modified
+  .apps_data/openproject/openproject_dump.sql:users: +0 added, -0 deleted, ~1 modified
+  .apps_data/openproject/openproject_dump.sql:watchers: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:work_package_hierarchies: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:work_package_journals: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:work_packages: +1 added, -0 deleted, ~0 modified
+
+(238 tables unchanged)
+
+=== Database: .apps_data/nextcloud_browser/nextcloud.db ===
+
+=== Database: .apps_data/mysql/database_dump.sql ===
+(unchanged)
+
+=== Database: .apps_data/nextcloud_browser/database_dump.sql ===
+
+=== Database: .apps_data/openproject/openproject_dump.sql ===
+
+--- Table: journals ---
+Rows Added (1):
+  {"id": 59, "journable_type": "WorkPackage", "journable_id": 47, "user_id": 4, "notes": "", "created_at": "2026-11-27 09:45:30.144804+00", "version": 1, "updated_at": "2026-11-27 09:45:30.668702+00", "data_type": "Journal::WorkPackageJournal", "data_id": 108, "cause": "{}", "validity_period": "[\"2026-11-27 09:45:30.144804+00\",)", "restricted": "false"}
+
+--- Table: sessions ---
+Rows Added (1):
+  {"id": 8, "session_id": "2::5a5eb549bd68f3581908c3339516fc70f7a38cf6d085e883c6b9204bf0335e37", "data": "BAh7C0kiDXBsYXRmb3JtBjoGRUZJIgxVbmtub3duBjsAVEkiDGJyb3dzZXIG\nOwBGSSIUVW5rbm93biBCcm93c2VyBjsAVEkiFGJyb3dzZXJfdmVyc2lvbgY7\nAEZJIgYwBjsAVEkiDHVzZXJfaWQGOwBGaQlJIg91cGRhdGVkX2F0BjsARkl1\nOglUaW1lDWmrH4AMFuO0CjoNbmFub19udW1pAncBOg1uYW5vX2RlbmkGOg1z\ndWJtaWNybyIHN1A6C29mZnNldGkAOgl6b25lSSIIVVRDBjsARkkiEF9jc3Jm\nX3Rva2VuBjsARkkiMHNVR19vTFRiUlJSQ09wYktUT3I5eWpFalFzZ3BVYzVo\nSkF6UzBVbUZzUUUGOwBG\n", "updated_at": "2026-11-27 09:45:19.665047+00", "user_id": 4}
+
+--- Table: settings ---
+Rows Added (1):
+  {"id": 177, "name": "installation_uuid", "value": "bc4a9118-4dd4-43f0-b4ff-e0b916f02740", "updated_at": "2026-11-27 09:45:16.028152+00"}
+Rows Modified (1):
+  Before: {"id": 176, "name": "host_name", "value": "127.0.0.1:5009", "updated_at": "2026-11-27 09:43:53.408728+00"}
+  After:  {"id": 176, "name": "host_name", "value": "localhost:5008", "updated_at": "2026-11-27 09:45:09.566209+00"}
+
+
+--- Table: users ---
+Rows Modified (1):
+  Before: {"id": 4, "login": "admin", "firstname": "OpenProject", "lastname": "Admin", "mail": "admin@example.net", "admin": "true", "status": 1, "last_login_on": null, "language": "en", "ldap_auth_source_id": null, "created_at": "2026-11-27 09:22:09.861858+00", "updated_at": "2026-11-27 09:22:09.861858+00", "type": "User", "identity_url": null, "first_login": "true", "force_password_change": "false", "failed_login_count": 0, "last_failed_login_on": null, "consented_at": null, "webauthn_id": null}
+  After:  {"id": 4, "login": "admin", "firstname": "OpenProject", "lastname": "Admin", "mail": "admin@example.net", "admin": "true", "status": 1, "last_login_on": "2026-11-27 09:45:13.952509+00", "language": "en", "ldap_auth_source_id": null, "created_at": "2026-11-27 09:22:09.861858+00", "updated_at": "2026-11-27 09:45:14.069948+00", "type": "User", "identity_url": null, "first_login": "false", "force_password_change": "false", "failed_login_count": 0, "last_failed_login_on": null, "consented_at": null, "webauthn_id": null}
+
+
+--- Table: watchers ---
+Rows Added (1):
+  {"id": 13, "watchable_type": "WorkPackage", "watchable_id": 47, "user_id": 4}
+
+--- Table: work_package_hierarchies ---
+(no stable row key: a changed row shows as one deleted row and one added row)
+Rows Added (1):
+  {"ancestor_id": 47, "descendant_id": 47, "generations": 0}
+
+--- Table: work_package_journals ---
+Rows Added (1):
+  {"id": 108, "type_id": 1, "project_id": 3, "subject": "PTO determination for Corwyn Office Complex PV (PXA-2023-0629)", "description": "**Determination:** Permission to Operate can be issued on 08/04/2025. All commissioning items are accepted, witness test completed, telemetry live, and AHJ final approval obtained (see Commissioning Checklist, Witness Test Record, and ISA summary). \n\n**Outstanding items:** None on the DER Program record. The four matters noted as separate review (RTU/POI installation, POI settings, queue position, system impact study) are outside this memo and have already been addressed in their respective reviews. No additional actions are required before the requested PTO date.\n\n**Required actions:**\n- Signature of this memo by the reviewing P.E. (to be added to the final document).\n- Formal issuance of the PTO letter by the System Operations Center on or before 08/04/2025.\n\nPrepared by: [Reviewing Engineer, P.E.] \u2013 DER Program Office", "due_date": null, "category_id": null, "status_id": 1, "assigned_to_id": null, "priority_id": 8, "version_id": null, "author_id": 4, "done_ratio": null, "estimated_hours": null, "start_date": null, "parent_id": null, "responsible_id": null, "budget_id": null, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "duration": null, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null}
+
+--- Table: work_packages ---
+Rows Added (1):
+  {"id": 47, "type_id": 1, "project_id": 3, "subject": "PTO determination for Corwyn Office Complex PV (PXA-2023-0629)", "description": "**Determination:** Permission to Operate can be issued on 08/04/2025. All commissioning items are accepted, witness test completed, telemetry live, and AHJ final approval obtained (see Commissioning Checklist, Witness Test Record, and ISA summary). \n\n**Outstanding items:** None on the DER Program record. The four matters noted as separate review (RTU/POI installation, POI settings, queue position, system impact study) are outside this memo and have already been addressed in their respective reviews. No additional actions are required before the requested PTO date.\n\n**Required actions:**\n- Signature of this memo by the reviewing P.E. (to be added to the final document).\n- Formal issuance of the PTO letter by the System Operations Center on or before 08/04/2025.\n\nPrepared by: [Reviewing Engineer, P.E.] \u2013 DER Program Office", "due_date": null, "category_id": null, "status_id": 1, "assigned_to_id": null, "priority_id": 8, "version_id": null, "author_id": 4, "lock_version": 0, "done_ratio": null, "estimated_hours": null, "created_at": "2026-11-27 09:45:30.144804+00", "updated_at": "2026-11-27 09:45:30.668702+00", "start_date": null, "responsible_id": null, "budget_id": null, "position": 1, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "parent_id": null, "duration": null, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null, "project_phase_id": null}
+
+=== Database: .apps_data/wiki_js/wiki_dump.sql ===
+
+=== Database: json ===
+</database_changes>

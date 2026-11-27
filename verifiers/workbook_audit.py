@@ -334,6 +334,7 @@ def audit_workbook_bytes(
     sum_cols: tuple[str, ...] = ("labor_mh", "labor_usd", "equipment_usd", "material_usd", "subcontract_usd"),
     rollup_tolerance: float = 0.05,
     require_cached_formulas: bool = False,
+    template_schemas: dict[str, dict[str, list[str]]] | None = None,
 ) -> dict[str, Any]:
     """Audits an XLSX workbook independently for errors, inventory coverage, row sums, and narrative parity."""
     defects: list[dict[str, Any]] = []
@@ -407,6 +408,67 @@ def audit_workbook_bytes(
                 severity="hard" if require_cached_formulas else "warning",
             )
         )
+
+    if template_schemas:
+        cand_sheets = set(wb_f.sheetnames)
+        best_tmpl_name: str | None = None
+        best_tmpl_sheets: dict[str, list[str]] | None = None
+        best_score = (0, 0.0)
+        for tmpl_name, tmpl_sheets in template_schemas.items():
+            if not tmpl_sheets:
+                continue
+            overlap = len(cand_sheets & set(tmpl_sheets.keys()))
+            min_req = 1 if len(tmpl_sheets) == 1 else 2
+            if overlap >= min_req:
+                ratio = overlap / max(1, len(tmpl_sheets))
+                score = (overlap, ratio)
+                if score > best_score:
+                    best_score = score
+                    best_tmpl_name = tmpl_name
+                    best_tmpl_sheets = tmpl_sheets
+        if best_tmpl_name and best_tmpl_sheets:
+            for req_sheet, req_cols in best_tmpl_sheets.items():
+                if req_sheet not in wb_f.sheetnames:
+                    defects.append(
+                        make_defect(
+                            item=f"template_missing_sheet:{req_sheet}",
+                            requirement_source=f"Starter template '{best_tmpl_name}' sheet structure",
+                            measured=wb_f.sheetnames,
+                            limit=req_sheet,
+                            tolerance=0,
+                            earliest_suspect_dependency=f"Clone '{best_tmpl_name}' directly preserving sheet '{req_sheet}'",
+                            severity="blocker",
+                        )
+                    )
+                    continue
+                if not req_cols:
+                    continue
+                ws_t = wb_f[req_sheet]
+                ws_tv = wb_v[req_sheet]
+                seen_headers: set[str] = set()
+                for rr in range(1, min(6, ws_t.max_row + 1)):
+                    for cc in range(1, ws_t.max_column + 1):
+                        for raw_val in (ws_t.cell(rr, cc).value, ws_tv.cell(rr, cc).value):
+                            if raw_val is not None:
+                                s_val = str(raw_val).strip()
+                                if s_val:
+                                    seen_headers.add(s_val)
+                missing_cols = [col for col in req_cols if col not in seen_headers]
+                if missing_cols:
+                    defects.append(
+                        make_defect(
+                            item=f"template_missing_columns:{req_sheet}",
+                            requirement_source=f"Starter template '{best_tmpl_name}' column contract",
+                            measured=f"missing {missing_cols}",
+                            limit=req_cols,
+                            tolerance=0,
+                            earliest_suspect_dependency=(
+                                f"Restore missing columns {missing_cols} in sheet '{req_sheet}' by modifying "
+                                f"a copy of '{best_tmpl_name}' in-place"
+                            ),
+                            severity="blocker",
+                        )
+                    )
 
     # Check required item IDs in summary/items sheets
     present_items: set[str] = set()
@@ -567,30 +629,188 @@ def audit_workbook_bytes(
     }
 
 
-def audit_zip_deliverables(zip_bytes: bytes, **kwargs: Any) -> dict[str, Any]:
-    """Opens a submission.zip in memory, locates XLSX + Markdown narrative, and runs audit_workbook_bytes."""
+_ZIP_PLACEHOLDER_RE = re.compile(
+    r"(?:\b(?:TODO|TBD|FIXME|XXX)\b|\[INSERT\b|iteration-1\s+provisional)",
+    re.I,
+)
+_NEGATED_PLACEHOLDER_RE = re.compile(
+    r"\b(?:no|zero|none|without|resolved|replaced|cleared)\b[^\n.;]{0,30}(?:\b(?:TBD|TODO|FIXME|XXX|placeholders?)\b|provisional)",
+    re.I,
+)
+
+
+def _find_placeholder_hits(text: str, source_name: str, defects: list[dict[str, Any]]) -> None:
+    """Appends a defect if unnegated unfinished placeholder/provisional markers appear."""
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if _NEGATED_PLACEHOLDER_RE.search(line):
+            continue
+        m = _ZIP_PLACEHOLDER_RE.search(line)
+        if m:
+            defects.append(
+                make_defect(
+                    item=f"placeholder_marker:{source_name}",
+                    requirement_source="Deliverable finality check",
+                    measured=f"line {lineno}: {m.group(0)}",
+                    limit="0 unfinished placeholders",
+                    tolerance=0,
+                    earliest_suspect_dependency=f"Replace placeholder/provisional text in {source_name}",
+                )
+            )
+            return
+
+
+def _scan_xlsx_placeholders(xlsx_bytes: bytes, source_name: str, defects: list[dict[str, Any]]) -> None:
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
+    for sname in wb.sheetnames:
+        ws = wb[sname]
+        for r in range(1, ws.max_row + 1):
+            for c in range(1, ws.max_column + 1):
+                val = ws.cell(r, c).value
+                if isinstance(val, str) and not val.startswith("="):
+                    if _NEGATED_PLACEHOLDER_RE.search(val):
+                        continue
+                    m = _ZIP_PLACEHOLDER_RE.search(val)
+                    if m:
+                        defects.append(
+                            make_defect(
+                                item=f"placeholder_marker:{source_name}",
+                                requirement_source="Deliverable finality check",
+                                measured=f"{sname}!R{r}C{c}: {m.group(0)}",
+                                limit="0 unfinished placeholders",
+                                tolerance=0,
+                                earliest_suspect_dependency=f"Replace placeholder text in {source_name} ({sname})",
+                            )
+                        )
+                        return
+
+
+def audit_zip_deliverables(
+    zip_bytes: bytes,
+    *,
+    require_xlsx: bool = True,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Opens a submission zip in memory and recursively audits all XLSX, DXF, PDF, IFC, and narrative members."""
+    from verifiers.cad_pdf_audit import audit_dxf_bytes, audit_pdf_bytes
+    from verifiers.geometry_ifc_audit import audit_ifc4_bytes
+
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-        names = zf.namelist()
-        xlsx_names = [n for n in names if n.lower().endswith(".xlsx")]
-        md_names = [n for n in names if n.lower().endswith((".md", ".txt"))]
-        if not xlsx_names:
+        corrupt = zf.testzip()
+        if corrupt is not None:
             return {
                 "ok": False,
-                "zip_entries": names,
+                "zip_entries": zf.namelist(),
                 "defects": [
                     make_defect(
-                        item="missing_xlsx",
-                        requirement_source="submission.zip deliverable packaging",
-                        measured=names,
-                        limit=">= 1 .xlsx workbook",
+                        item=f"zip_corrupt_member:{corrupt}",
+                        requirement_source="submission.zip CRC integrity check",
+                        measured=corrupt,
+                        limit="valid CRC-32 across all members",
                         tolerance=0,
-                        earliest_suspect_dependency="Workbook generation/export into submission.zip",
+                        earliest_suspect_dependency=f"Archive packaging of {corrupt}",
                     )
                 ],
                 "warnings": [],
             }
-        narrative = "\n".join(zf.read(m).decode("utf-8", errors="replace") for m in md_names)
-        res = audit_workbook_bytes(zf.read(xlsx_names[0]), narrative_text=narrative, **kwargs)
-        res["zip_entries"] = names
-        res["audited_xlsx"] = xlsx_names[0]
-        return res
+
+        infos = [info for info in zf.infolist() if not info.is_dir()]
+        names = [info.filename for info in infos]
+        if not names:
+            return {
+                "ok": False,
+                "zip_entries": [],
+                "defects": [
+                    make_defect(
+                        item="zip_empty",
+                        requirement_source="submission.zip deliverable packaging",
+                        measured=0,
+                        limit=">= 1 deliverable file",
+                        tolerance=0,
+                        earliest_suspect_dependency="Populate submission.zip with requested deliverables",
+                    )
+                ],
+                "warnings": [],
+            }
+
+        defects: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        for info in infos:
+            if info.file_size == 0:
+                defects.append(
+                    make_defect(
+                        item=f"empty_zip_member:{info.filename}",
+                        requirement_source="submission.zip non-empty member check",
+                        measured=0,
+                        limit="> 0 bytes",
+                        tolerance=0,
+                        earliest_suspect_dependency=f"Write non-empty deliverable content to {info.filename}",
+                    )
+                )
+
+        xlsx_names = [n for n in names if n.lower().endswith((".xlsx", ".xlsm"))]
+        md_names = [n for n in names if n.lower().endswith((".md", ".txt"))]
+        dxf_names = [n for n in names if n.lower().endswith(".dxf")]
+        pdf_names = [n for n in names if n.lower().endswith(".pdf")]
+        ifc_names = [n for n in names if n.lower().endswith(".ifc")]
+
+        narrative_parts: list[str] = []
+        for m in md_names:
+            text = zf.read(m).decode("utf-8", errors="replace")
+            narrative_parts.append(text)
+            _find_placeholder_hits(text, m, defects)
+        narrative = "\n".join(narrative_parts)
+
+        primary_res: dict[str, Any] = {}
+        audited_members: list[str] = []
+        if xlsx_names:
+            for idx, xname in enumerate(xlsx_names):
+                xbytes = zf.read(xname)
+                xres = audit_workbook_bytes(xbytes, narrative_text=narrative, **kwargs)
+                _scan_xlsx_placeholders(xbytes, xname, defects)
+                if idx == 0:
+                    primary_res = dict(xres)
+                else:
+                    defects.extend(xres.get("defects") or [])
+                    warnings.extend(xres.get("warnings") or [])
+                audited_members.append(xname)
+        elif require_xlsx:
+            defects.append(
+                make_defect(
+                    item="missing_xlsx",
+                    requirement_source="submission.zip deliverable packaging",
+                    measured=names,
+                    limit=">= 1 .xlsx workbook",
+                    tolerance=0,
+                    earliest_suspect_dependency="Workbook generation/export into submission.zip",
+                )
+            )
+
+        for dname in dxf_names:
+            dres = audit_dxf_bytes(zf.read(dname))
+            defects.extend(dres.get("defects") or [])
+            warnings.extend(dres.get("warnings") or [])
+            audited_members.append(dname)
+
+        for pname in pdf_names:
+            pres = audit_pdf_bytes(zf.read(pname))
+            defects.extend(pres.get("defects") or [])
+            warnings.extend(pres.get("warnings") or [])
+            audited_members.append(pname)
+
+        for iname in ifc_names:
+            ires = audit_ifc4_bytes(zf.read(iname))
+            defects.extend(ires.defects or [])
+            audited_members.append(iname)
+
+        merged_defects = (primary_res.get("defects") or []) + defects
+        merged_warnings = (primary_res.get("warnings") or []) + warnings
+        out = dict(primary_res)
+        out["ok"] = len(merged_defects) == 0
+        out["defects"] = merged_defects
+        out["warnings"] = merged_warnings
+        out["zip_entries"] = names
+        out["audited_members"] = audited_members
+        if xlsx_names:
+            out["audited_xlsx"] = xlsx_names[0]
+            out["audited_xlsx_list"] = xlsx_names
+        return out

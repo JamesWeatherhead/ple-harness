@@ -1,0 +1,26 @@
+To: Lena Kovalchuk, System Operations Center
+From: [Reviewing Engineer, P.E.] – DER Program Office
+Date: 07/14/2025
+Re: Permission-to-Operate (PTO) – Corwyn Office Complex PV (PXA-2023-0629) – Requested Effective Date 08/04/2025
+
+---
+
+**Decision**
+Permission to Operate can be issued on 08/04/2025. All commissioning items are accepted, witness test completed, telemetry live, and AHJ final approval obtained (see Commissioning Checklist, Witness Test Record, and ISA summary).
+
+---
+
+**Prerequisite**
+No outstanding prerequisites remain on the DER Program record. The four matters identified as separate review (RTU/POI installation, POI settings, queue position, system impact study) are already resolved in their respective reviews and are outside the scope of this memo.
+
+---
+
+**Change**
+No changes to the design, equipment, or operating parameters are required prior to PTO. The memo shall be signed by the reviewing P.E. and the PTO letter issued by the System Operations Center on or before 08/04/2025.
+
+---
+
+Prepared by: [Name], P.E., DER Program Office
+Reviewed & Approved: _________________________ (Signature)
+
+End of memo.

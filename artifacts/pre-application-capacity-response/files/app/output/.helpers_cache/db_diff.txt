@@ -1,0 +1,69 @@
+<database_changes>
+=== DATABASE CHANGES SUMMARY ===
+Total rows added: 3
+Total rows deleted: 1
+Total rows modified: 4
+
+2 JSON file(s) excluded from this diff (not application state):
+  .apps_data/.coordinator/checkpoint_observations/physical_time.json: not application state
+  .apps_data/.coordinator/config/config.json: not application state
+
+Tables with changes (6):
+  .apps_data/openproject/openproject_dump.sql:journals: +0 added, -0 deleted, ~1 modified
+  .apps_data/openproject/openproject_dump.sql:sessions: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:settings: +1 added, -0 deleted, ~1 modified
+  .apps_data/openproject/openproject_dump.sql:users: +0 added, -0 deleted, ~1 modified
+  .apps_data/openproject/openproject_dump.sql:work_package_journals: +1 added, -1 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:work_packages: +0 added, -0 deleted, ~1 modified
+
+(240 tables unchanged)
+
+=== Database: .apps_data/nextcloud_browser/nextcloud.db ===
+
+=== Database: .apps_data/mysql/database_dump.sql ===
+(unchanged)
+
+=== Database: .apps_data/nextcloud_browser/database_dump.sql ===
+
+=== Database: .apps_data/openproject/openproject_dump.sql ===
+
+--- Table: journals ---
+Rows Modified (1):
+  Before: {"id": 56, "journable_type": "WorkPackage", "journable_id": 44, "user_id": 4, "notes": "", "created_at": "2026-11-27 09:54:42.09222+00", "version": 1, "updated_at": "2026-11-27 09:54:42.263677+00", "data_type": "Journal::WorkPackageJournal", "data_id": 102, "cause": "{}", "validity_period": "[\"2026-11-27 09:54:42.09222+00\",)", "restricted": "false"}
+  After:  {"id": 56, "journable_type": "WorkPackage", "journable_id": 44, "user_id": 4, "notes": "Response sent to Northline Renewables on November 27, 2026. Document saved at /filesystem/ALN-108_PreApplication_Response.docx. Case closed.", "created_at": "2026-11-27 09:54:42.09222+00", "version": 1, "updated_at": "2026-11-27 09:58:43.026425+00", "data_type": "Journal::WorkPackageJournal", "data_id": 107, "cause": "{}", "validity_period": "[\"2026-11-27 09:54:42.09222+00\",)", "restricted": "false"}
+
+
+--- Table: sessions ---
+Rows Added (1):
+  {"id": 8, "session_id": "2::80cda56e974a5521c9fca0a52f9aee124a6067c986ec8ed987bd5a70cf1fca6c", "data": "BAh7C0kiDXBsYXRmb3JtBjoGRUZJIgxVbmtub3duBjsAVEkiDGJyb3dzZXIG\nOwBGSSIUVW5rbm93biBCcm93c2VyBjsAVEkiFGJyb3dzZXJfdmVyc2lvbgY7\nAEZJIgYwBjsAVEkiDHVzZXJfaWQGOwBGaQlJIg91cGRhdGVkX2F0BjsARkl1\nOglUaW1lDWmrH4DlyqzoCjoNbmFub19udW1pArsDOg1uYW5vX2RlbmkGOg1z\ndWJtaWNybyIHlVA6C29mZnNldGkAOgl6b25lSSIIVVRDBjsARkkiEF9jc3Jm\nX3Rva2VuBjsARkkiMDkzOGNOdTFUUUxMNTRpdVRlMWJ5WnhPRjA0S3dlS0NG\ndVplX2R6bmo2ckEGOwBG\n", "updated_at": "2026-11-27 09:58:14.840647+00", "user_id": 4}
+
+--- Table: settings ---
+Rows Added (1):
+  {"id": 177, "name": "installation_uuid", "value": "1858fc26-db30-41a6-8b36-0b83cd5bf746", "updated_at": "2026-11-27 09:58:12.862685+00"}
+Rows Modified (1):
+  Before: {"id": 176, "name": "host_name", "value": "127.0.0.1:5009", "updated_at": "2026-11-27 09:56:24.511114+00"}
+  After:  {"id": 176, "name": "host_name", "value": "localhost:5008", "updated_at": "2026-11-27 09:58:07.723163+00"}
+
+
+--- Table: users ---
+Rows Modified (1):
+  Before: {"id": 4, "login": "admin", "firstname": "OpenProject", "lastname": "Admin", "mail": "admin@example.net", "admin": "true", "status": 1, "last_login_on": null, "language": "en", "ldap_auth_source_id": null, "created_at": "2026-11-27 09:22:09.861858+00", "updated_at": "2026-11-27 09:22:09.861858+00", "type": "User", "identity_url": null, "first_login": "true", "force_password_change": "false", "failed_login_count": 0, "last_failed_login_on": null, "consented_at": null, "webauthn_id": null}
+  After:  {"id": 4, "login": "admin", "firstname": "OpenProject", "lastname": "Admin", "mail": "admin@example.net", "admin": "true", "status": 1, "last_login_on": "2026-11-27 09:58:10.677736+00", "language": "en", "ldap_auth_source_id": null, "created_at": "2026-11-27 09:22:09.861858+00", "updated_at": "2026-11-27 09:58:10.706494+00", "type": "User", "identity_url": null, "first_login": "false", "force_password_change": "false", "failed_login_count": 0, "last_failed_login_on": null, "consented_at": null, "webauthn_id": null}
+
+
+--- Table: work_package_journals ---
+Rows Added (1):
+  {"id": 107, "type_id": 1, "project_id": 3, "subject": "Respond to the Feeder ALN-108 pre-application request", "description": "A pre-application request dated 07/02/2025 asks for available capacity on Feeder ALN-108 and cites the published hosting capacity map. Determine the figure the response should carry and what the requester should be advised. Flag any map maintenance the request implies.", "due_date": "2025-08-15", "category_id": null, "status_id": 1, "assigned_to_id": 9, "priority_id": 8, "version_id": 5, "author_id": 4, "done_ratio": 0, "estimated_hours": null, "start_date": "2025-07-02", "parent_id": null, "responsible_id": null, "budget_id": null, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "duration": 33, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null}
+Rows Deleted (1):
+  {"id": 102, "type_id": 1, "project_id": 3, "subject": "Respond to the Feeder ALN-108 pre-application request", "description": "A pre-application request dated 07/02/2025 asks for available capacity on Feeder ALN-108 and cites the published hosting capacity map. Determine the figure the response should carry and what the requester should be advised. Flag any map maintenance the request implies.", "due_date": "2025-08-15", "category_id": null, "status_id": 1, "assigned_to_id": 9, "priority_id": 8, "version_id": 5, "author_id": 4, "done_ratio": 0, "estimated_hours": null, "start_date": "2025-07-02", "parent_id": null, "responsible_id": null, "budget_id": null, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "duration": 33, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null}
+
+--- Table: work_packages ---
+Rows Modified (1):
+  Before: {"id": 44, "type_id": 1, "project_id": 3, "subject": "Respond to the Feeder ALN-108 pre-application request", "description": "A pre-application request dated 07/02/2025 asks for available capacity on Feeder ALN-108 and cites the published hosting capacity map. Determine the figure the response should carry and what the requester should be advised. Flag any map maintenance the request implies.", "due_date": "2025-08-15", "category_id": null, "status_id": 1, "assigned_to_id": 9, "priority_id": 8, "version_id": 5, "author_id": 4, "lock_version": 0, "done_ratio": 0, "estimated_hours": null, "created_at": "2026-11-27 09:54:42.09222+00", "updated_at": "2026-11-27 09:54:42.263677+00", "start_date": "2025-07-02", "responsible_id": null, "budget_id": null, "position": 1, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "parent_id": null, "duration": 33, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null, "project_phase_id": null}
+  After:  {"id": 44, "type_id": 1, "project_id": 3, "subject": "Respond to the Feeder ALN-108 pre-application request", "description": "A pre-application request dated 07/02/2025 asks for available capacity on Feeder ALN-108 and cites the published hosting capacity map. Determine the figure the response should carry and what the requester should be advised. Flag any map maintenance the request implies.", "due_date": "2025-08-15", "category_id": null, "status_id": 1, "assigned_to_id": 9, "priority_id": 8, "version_id": 5, "author_id": 4, "lock_version": 0, "done_ratio": 0, "estimated_hours": null, "created_at": "2026-11-27 09:54:42.09222+00", "updated_at": "2026-11-27 09:58:43.026425+00", "start_date": "2025-07-02", "responsible_id": null, "budget_id": null, "position": 1, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "parent_id": null, "duration": 33, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null, "project_phase_id": null}
+
+
+=== Database: .apps_data/wiki_js/wiki_dump.sql ===
+
+=== Database: json ===
+</database_changes>

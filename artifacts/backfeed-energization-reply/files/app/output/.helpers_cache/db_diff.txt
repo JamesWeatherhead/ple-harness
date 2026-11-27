@@ -1,0 +1,74 @@
+<database_changes>
+=== DATABASE CHANGES SUMMARY ===
+Total rows added: 7
+Total rows deleted: 0
+Total rows modified: 2
+
+2 JSON file(s) excluded from this diff (not application state):
+  .apps_data/.coordinator/checkpoint_observations/physical_time.json: not application state
+  .apps_data/.coordinator/config/config.json: not application state
+
+Tables with changes (8):
+  .apps_data/openproject/openproject_dump.sql:journals: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:sessions: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:settings: +1 added, -0 deleted, ~1 modified
+  .apps_data/openproject/openproject_dump.sql:users: +0 added, -0 deleted, ~1 modified
+  .apps_data/openproject/openproject_dump.sql:watchers: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:work_package_hierarchies: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:work_package_journals: +1 added, -0 deleted, ~0 modified
+  .apps_data/openproject/openproject_dump.sql:work_packages: +1 added, -0 deleted, ~0 modified
+
+(238 tables unchanged)
+
+=== Database: .apps_data/nextcloud_browser/nextcloud.db ===
+
+=== Database: .apps_data/mysql/database_dump.sql ===
+(unchanged)
+
+=== Database: .apps_data/nextcloud_browser/database_dump.sql ===
+
+=== Database: .apps_data/openproject/openproject_dump.sql ===
+
+--- Table: journals ---
+Rows Added (1):
+  {"id": 59, "journable_type": "WorkPackage", "journable_id": 47, "user_id": 4, "notes": "", "created_at": "2026-11-27 10:37:03.156341+00", "version": 1, "updated_at": "2026-11-27 10:37:03.436073+00", "data_type": "Journal::WorkPackageJournal", "data_id": 108, "cause": "{}", "validity_period": "[\"2026-11-27 10:37:03.156341+00\",)", "restricted": "false"}
+
+--- Table: sessions ---
+Rows Added (1):
+  {"id": 8, "session_id": "2::6bed513df72a39f04da242923e138e02692837869f4e54c2a938f080ccbf11ea", "data": "BAh7C0kiDXBsYXRmb3JtBjoGRUZJIgxVbmtub3duBjsAVEkiDGJyb3dzZXIG\nOwBGSSIUVW5rbm93biBCcm93c2VyBjsAVEkiFGJyb3dzZXJfdmVyc2lvbgY7\nAEZJIgYwBjsAVEkiDHVzZXJfaWQGOwBGaQlJIg91cGRhdGVkX2F0BjsARkl1\nOglUaW1lDWqrH4BiThqTCjoNbmFub19udW1pAcw6DW5hbm9fZGVuaQY6DXN1\nYm1pY3JvIgcgQDoLb2Zmc2V0aQA6CXpvbmVJIghVVEMGOwBGSSIQX2NzcmZf\ndG9rZW4GOwBGSSIwTTdqS1pIYVZkSUJaMU9BZ2FuRFBtQ3VHWVlFVzVpLVI3\nMFJmdTJYYlZIRQY7AEY=\n", "updated_at": "2026-11-27 10:36:53.641109+00", "user_id": 4}
+
+--- Table: settings ---
+Rows Added (1):
+  {"id": 177, "name": "installation_uuid", "value": "6ecfa8e1-5ba4-4533-a18b-dff0b67ec3a0", "updated_at": "2026-11-27 10:36:50.882729+00"}
+Rows Modified (1):
+  Before: {"id": 176, "name": "host_name", "value": "127.0.0.1:5009", "updated_at": "2026-11-27 10:35:11.938502+00"}
+  After:  {"id": 176, "name": "host_name", "value": "localhost:5008", "updated_at": "2026-11-27 10:36:45.644894+00"}
+
+
+--- Table: users ---
+Rows Modified (1):
+  Before: {"id": 4, "login": "admin", "firstname": "OpenProject", "lastname": "Admin", "mail": "admin@example.net", "admin": "true", "status": 1, "last_login_on": null, "language": "en", "ldap_auth_source_id": null, "created_at": "2026-11-27 10:16:17.567832+00", "updated_at": "2026-11-27 10:16:17.567832+00", "type": "User", "identity_url": null, "first_login": "true", "force_password_change": "false", "failed_login_count": 0, "last_failed_login_on": null, "consented_at": null, "webauthn_id": null}
+  After:  {"id": 4, "login": "admin", "firstname": "OpenProject", "lastname": "Admin", "mail": "admin@example.net", "admin": "true", "status": 1, "last_login_on": "2026-11-27 10:36:49.468169+00", "language": "en", "ldap_auth_source_id": null, "created_at": "2026-11-27 10:16:17.567832+00", "updated_at": "2026-11-27 10:36:49.50538+00", "type": "User", "identity_url": null, "first_login": "false", "force_password_change": "false", "failed_login_count": 0, "last_failed_login_on": null, "consented_at": null, "webauthn_id": null}
+
+
+--- Table: watchers ---
+Rows Added (1):
+  {"id": 13, "watchable_type": "WorkPackage", "watchable_id": 47, "user_id": 4}
+
+--- Table: work_package_hierarchies ---
+(no stable row key: a changed row shows as one deleted row and one added row)
+Rows Added (1):
+  {"ancestor_id": 47, "descendant_id": 47, "generations": 0}
+
+--- Table: work_package_journals ---
+Rows Added (1):
+  {"id": 108, "type_id": 1, "project_id": 3, "subject": "Halbray Field Solar Site\u202f3 \u2013 Pre\u2011PTO backfeed requirements", "description": "**Outstanding items before energization on 2025\u201107\u201129**\n\n1. Final Kelloway Township electrical inspection (Permit EP\u201125\u20110418) \u2013 scheduled 2025\u201107\u201124. Inspection must be passed and a written sign\u2011off obtained.\n2. Distribution Operations backfeed switching order \u2013 must be issued and approved before the 2025\u201107\u201129 energization.\n3. Verify that all inverter CEL checks and witness test determinations are complete (recorded in commissioning checklist).\n4. Confirm telemetry (TCS\u201102) is live and reporting per SCADA/EMS requirements.\n\nAll other pre\u2011PTO items (ISA execution, RTU test, POI recloser acceptance, revenue meter set, protection coordination) are complete as of 2025\u201107\u201114.\n\nPlease coordinate the above tasks with the respective engineers and update this work package with status.", "due_date": null, "category_id": null, "status_id": 1, "assigned_to_id": null, "priority_id": 8, "version_id": null, "author_id": 4, "done_ratio": null, "estimated_hours": null, "start_date": null, "parent_id": null, "responsible_id": null, "budget_id": null, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "duration": null, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null}
+
+--- Table: work_packages ---
+Rows Added (1):
+  {"id": 47, "type_id": 1, "project_id": 3, "subject": "Halbray Field Solar Site\u202f3 \u2013 Pre\u2011PTO backfeed requirements", "description": "**Outstanding items before energization on 2025\u201107\u201129**\n\n1. Final Kelloway Township electrical inspection (Permit EP\u201125\u20110418) \u2013 scheduled 2025\u201107\u201124. Inspection must be passed and a written sign\u2011off obtained.\n2. Distribution Operations backfeed switching order \u2013 must be issued and approved before the 2025\u201107\u201129 energization.\n3. Verify that all inverter CEL checks and witness test determinations are complete (recorded in commissioning checklist).\n4. Confirm telemetry (TCS\u201102) is live and reporting per SCADA/EMS requirements.\n\nAll other pre\u2011PTO items (ISA execution, RTU test, POI recloser acceptance, revenue meter set, protection coordination) are complete as of 2025\u201107\u201114.\n\nPlease coordinate the above tasks with the respective engineers and update this work package with status.", "due_date": null, "category_id": null, "status_id": 1, "assigned_to_id": null, "priority_id": 8, "version_id": null, "author_id": 4, "lock_version": 0, "done_ratio": null, "estimated_hours": null, "created_at": "2026-11-27 10:37:03.156341+00", "updated_at": "2026-11-27 10:37:03.436073+00", "start_date": null, "responsible_id": null, "budget_id": null, "position": 1, "story_points": null, "remaining_hours": null, "derived_estimated_hours": null, "schedule_manually": "true", "parent_id": null, "duration": null, "ignore_non_working_days": "false", "derived_remaining_hours": null, "derived_done_ratio": null, "project_phase_id": null}
+
+=== Database: .apps_data/wiki_js/wiki_dump.sql ===
+
+=== Database: json ===
+</database_changes>

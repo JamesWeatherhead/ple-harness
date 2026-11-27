@@ -24,6 +24,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import types
 from typing import Any
 import zipfile
@@ -103,27 +104,65 @@ MAX_INCUMBENT_BYTES = 20 * 1024 * 1024
 
 AUDIT_EXTENSIONS = (".xlsx", ".xlsm", ".zip", ".ifc", ".docx", ".dxf", ".pdf")
 OUTPUT_PATH_RE = re.compile(
-    r"(?:^|[\s\"'(`=])(/[^\s\"')<>`]+\.(?:xlsx|xlsm|zip|ifc|docx|dxf|md|txt|json|pdf|csv))",
+    r"(?:^|[\s\"'(`=])((?:/|output/|submission/)[^\s\"')<>`]+\.(?:xlsx|xlsm|zip|ifc|docx|dxf|md|txt|json|pdf|csv))",
     re.I,
 )
 DELIVERABLE_MENTION_RE = re.compile(
-    r"(?:^|[\s\"'(`=/])([A-Za-z0-9._-]+\.(?:xlsx|xlsm|zip|ifc|docx|dxf|md|txt|json|pdf|csv))(?=$|[\s\"')`.,;:!?])",
+    r"(?:^|[\s\"'(`=/])([A-Za-z0-9._-]+\.(?:xlsx|xlsm|zip|ifc|docx|dxf|md|txt|json|pdf|csv|py))(?=$|[\s\"')`.,;:!?])",
+    re.I,
+)
+PREMATURE_NARRATION_RE = re.compile(
+    r"^\s*(?:I(?:'ll| will)|Let me|Now let me|Next,?\s+I|First,?\s+I)\b",
+    re.I,
+)
+MAX_PROGRESS_NUDGES = 8
+MAX_LENGTH_CONTINUES = 2
+EFFORT_STEP_DOWN = {"max": "high", "high": "medium", "medium": "low"}
+DELIVERABLE_EXTS = (".xlsx", ".xlsm", ".zip", ".ifc", ".docx", ".dxf", ".pdf", ".md", ".csv")
+MILESTONE_CHECKPOINTS = (10, 16, 22, 28, 35, 42)
+LONG_MILESTONE_CHECKPOINTS = (18, 26, 34, 42)
+TIME_MILESTONES = (0.20, 0.40, 0.60)
+READONLY_PATH_PARTS = (
+    "/input/",
+    "/inputs/",
+    "/reference/",
+    "/data/",
+    "/specs/",
+    "/templates/",
+    "/vendor_data/",
+    "/standards/",
+    "/criteria/",
+    "/drawings/",
+    "/geotech/",
+    "/planning/",
+    "/studies/",
+    "/screening/",
+    "/queue/",
+    "/correspondence/",
+    "/00_",
+    "/10_",
+    "/20_",
+    "/30_",
+    "/40_",
+    "/50_",
+)
+SPEC_PARSER_RE = re.compile(
+    r"\b(?:pypdf|pdftotext|pdfplumber|fitz|docx|openpyxl|pandas|cat|grep|os\.walk|glob)\b",
     re.I,
 )
 
 SYSTEM_PROMPT = """You are an expert physical-engineering coordinator working inside a Linux task container.
 Tools act in {workdir} (and no external internet exists).{mcp_note}
 
-Follow a disciplined 5-step engineering workflow:
-1. INDEX & PARSE REQUIREMENTS: List project files/revisions first. Record exact requested output paths, formats, units, dates, tolerances, standards, and any required MCP actions.
-2. RECORD GOVERNING EVIDENCE: Use record_evidence for consequential values (original value/unit, source locator, revision, dependents). Resolve conflicts explicitly with `supersedes` and check units with `convert_units`.
-3. COMPUTE & DECIDE DETERMINISTICALLY: Write clean Python verification/generation scripts executed via `bash`; check unit conversions, balances, geometry/clearances, and schedules numerically rather than by hand.
-4. PRODUCE REAL DELIVERABLES EARLY: Write exact requested formats (XLSX, DOCX, IFC4 STEP, PDF, Markdown) at exact requested paths and perform required task-local MCP actions with read-back verification. Use save_incumbent once a deliverable passes audit.
-5. COLD-READ VERIFY BEFORE FINISHING: Run `run_export_audit` (or Python readback checks) on saved bytes to verify workbook formulas/rollups/narrative reconciliation, IFC clashes/connectivity, or decision-memo prerequisite consistency.
+Follow a disciplined 4-step PE engineering workflow:
+1. EXTRACT ALL GOVERNING SPECS FIRST (1-2 batch Python scripts): Read EVERY relevant PDF (`pypdf`/`pdftotext`), DOCX (`python-docx`), XLSX, CSV, JSON, and drawing/spec in the workspace into concise summaries — extract governing design criteria, code clauses, revisions/addenda, unit conventions, and ALL constraint register IDs. NEVER guess or assume a parameter that exists in project documents.
+2. CLONE STARTER TEMPLATES IN-PLACE: Whenever a `*TEMPLATE*.xlsx` or starter `.ifc`/`.json` exists, ALWAYS open and populate a copy of it (`openpyxl.load_workbook(template)`) rather than constructing a fresh `Workbook()` from scratch — preserve every sheet name, column header, and formatting/formula structure. Compute all engineering checks, safety factors, and cost/objective optimizations deterministically in Python.
+3. RECORD EVIDENCE & USE MCP TOOLS: Call `record_evidence` for binding numbers/clauses (`supersedes` on conflicts, `convert_units` for unit consistency), and inspect task MCP tool results before writing dependent files/work packages; call `save_incumbent` whenever a deliverable passes audit.
+4. SELF-VERIFY SAVED DELIVERABLES: Recalculate formulas (`libreoffice --headless` if installed), execute any deliverable generator script (`solution.py`), verify `.ifc`/`.dxf`/`.xlsx`/`.zip` with container parsers (`ifcopenshell`, `ezdxf`, `openpyxl`), and run `run_export_audit` before finishing. NEVER modify read-only input specs/templates, and NEVER output transition chatter ("Let me check...") without a tool call.
 
 CRITICAL SEQUENTIAL RULE: NEVER guess or predict an external MCP output, file read, or calculation result in parallel with writing a file — always call the read/MCP/calculation tool first, wait for the returned observation, and then call `write_file` or `edit_file` on the following turn with the verified result.
 
-Time budget: about {minutes} minutes remaining (live updates follow tool results). When all requested artifacts and verifications are verified complete, answer without tool calls summarizing exact deliverable paths and traced results."""
+Time budget: about {minutes} minutes remaining (live updates follow tool results). Only when all requested deliverables and verifications are verified on disk, answer without tool calls summarizing exact paths and checked results."""
 
 SUMMARY_PROMPT = (
     "The conversation is getting long, so earlier turns will be removed. Summarize precisely: "
@@ -164,9 +203,11 @@ class RuntimeConfig:
     enable_evidence_ledger: bool
     enable_export_verifier: bool
     enable_incumbent_retention: bool
+    enable_milestone_guard: bool
     enable_image_input: bool
     max_verify_repairs: int
     max_model_calls: int = 0
+    enable_workspace_recon: bool = False
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -188,9 +229,11 @@ class RuntimeConfig:
             enable_evidence_ledger=_env_bool("ENABLE_EVIDENCE_LEDGER", True),
             enable_export_verifier=_env_bool("ENABLE_EXPORT_VERIFIER", True),
             enable_incumbent_retention=_env_bool("ENABLE_INCUMBENT_RETENTION", True),
+            enable_milestone_guard=_env_bool("ENABLE_MILESTONE_GUARD", True),
             enable_image_input=_env_bool("ENABLE_IMAGE_INPUT", False),
             max_verify_repairs=max(0, int(os.environ.get("MAX_VERIFY_REPAIRS", "2"))),
             max_model_calls=max(0, int(os.environ.get("MAX_MODEL_CALLS", "0") or "0")),
+            enable_workspace_recon=_env_bool("ENABLE_WORKSPACE_RECON", False),
         )
 
 
@@ -620,6 +663,7 @@ class EngineeringCoordinator:
         self.responses = self.config.responses_api
         self.finish_margin = float(self.config.reserve_verify_sec)
         self.touched_deliverables: dict[str, int] = {}
+        self.deliverable_files_written: set[str] = set()
         self.bash_detected_paths: set[str] = set()
         self.verified_paths: dict[str, int] = {}
         self.incumbents: dict[str, tuple[bytes, str]] = {}
@@ -628,12 +672,259 @@ class EngineeringCoordinator:
         self._wrote_after_mcp = False
         self._pending_images: list[tuple[str, str]] = []
         self._last_durable_summary = ""
+        self._total_time_sec: float | None = None
+        self._fired_time_milestones: set[float] = set()
+        self._initial_files: set[str] = set()
+        self._template_schemas: dict[str, dict[str, list[str]]] = {}
+        self._input_spec_files: list[str] = []
+        self._spec_reads_seen: bool = False
+        self._spec_gate_fired: bool = False
+
+    async def _step_down_effort(self) -> None:
+        cur = str(self.effort.get("reasoning_effort") or "").lower()
+        nxt = EFFORT_STEP_DOWN.get(cur)
+        if nxt:
+            self.effort["reasoning_effort"] = nxt
+            await self.session.log(f"effort backed off from {cur} to {nxt} after hidden-reasoning length cutoff")
+        elif "reasoning_effort" in self.effort:
+            self.effort = {}
+            await self.session.log("dropped reasoning_effort after repeated hidden-reasoning length cutoff")
+
+    def _milestone_note(self, left: float | None) -> str:
+        if not self.config.enable_milestone_guard:
+            return ""
+        notes: list[str] = []
+        calls = self.usage_tracker.calls
+        checkpoints = (
+            MILESTONE_CHECKPOINTS
+            if 0 < self.config.max_model_calls <= 20
+            else LONG_MILESTONE_CHECKPOINTS
+        )
+        if not self.deliverable_files_written:
+            time_hit = False
+            if self.config.max_model_calls == 0 and self._total_time_sec and left is not None and self._total_time_sec > 0:
+                frac = (self._total_time_sec - left) / self._total_time_sec
+                for thresh in TIME_MILESTONES:
+                    if thresh not in self._fired_time_milestones and frac >= thresh:
+                        self._fired_time_milestones.add(thresh)
+                        time_hit = True
+            if calls in checkpoints or time_hit:
+                notes.append(
+                    f"[HARNESS MILESTONE — Call {calls}: 0 target deliverable files created on disk yet. "
+                    "Ensure you have extracted all governing specs, then clone any starter template in-place "
+                    "to write a populated, schema-valid deliverable at the requested path, verify it, and refine.]"
+                )
+        rem = (self.config.max_model_calls - calls) if self.config.max_model_calls > 3 else 0
+        if rem == 3 or (not self.deliverable_files_written and rem in (1, 2)):
+            notes.append(
+                f"[HARNESS CALL BUDGET WARNING: {rem} model call(s) remain before MAX_MODEL_CALLS={self.config.max_model_calls}. "
+                "Write/finalize your deliverable on disk and run run_export_audit now.]"
+            )
+        return ("\n" + "\n".join(notes)) if notes else ""
+
+    async def _workspace_recon(self) -> str:
+        """Runs a single Turn-0 read-only inventory + starter template schema extraction."""
+        if not self.config.enable_workspace_recon:
+            return ""
+        script = r"""python3 - <<'__PLE_RECON__'
+import importlib.util, json, os, shutil
+
+root = os.getcwd()
+skip = {".git", "__pycache__", ".venv", "node_modules", ".apps_data", ".helpers_cache"}
+all_files = []
+for cur, dirs, files in os.walk(root):
+    dirs[:] = sorted(d for d in dirs if d not in skip)
+    for fn in sorted(files):
+        fp = os.path.join(cur, fn)
+        rel = os.path.relpath(fp, root)
+        try:
+            sz = os.path.getsize(fp)
+        except OSError:
+            sz = 0
+        all_files.append({"path": rel, "size": sz})
+
+all_files_sorted = sorted(all_files, key=lambda x: x["path"])
+templates = []
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
+
+if openpyxl is not None:
+    for item in all_files_sorted:
+        rel = item["path"]
+        low = rel.lower()
+        if not low.endswith((".xlsx", ".xlsm")) or item["size"] > 5 * 1024 * 1024:
+            continue
+        if "template" not in low and "/templates/" not in f"/{low}":
+            continue
+        try:
+            wb = openpyxl.load_workbook(os.path.join(root, rel), read_only=True, data_only=False)
+            sheets = {}
+            for sname in wb.sheetnames:
+                ws = wb[sname]
+                headers = []
+                fallback_row = []
+                samples = []
+                row_count = 0
+                for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                    row_count = r_idx
+                    vals = [str(v).strip() for v in row if v is not None and str(v).strip() != ""]
+                    if r_idx <= 5:
+                        if not fallback_row and vals:
+                            fallback_row = vals
+                        if not headers and len(vals) >= 2:
+                            headers = vals
+                    elif row and row[0] is not None and len(samples) < 6:
+                        s0 = str(row[0]).strip()
+                        if s0 and not s0.startswith("="):
+                            samples.append(s0[:40])
+                    if r_idx >= 500:
+                        break
+                if not headers:
+                    headers = fallback_row
+                sheets[sname] = {
+                    "rows": row_count,
+                    "headers": headers,
+                    "col_a_samples": samples,
+                }
+            wb.close()
+            templates.append({"path": rel, "sheets": sheets})
+        except Exception as exc:
+            templates.append({"path": rel, "error": str(exc), "sheets": {}})
+        if len(templates) >= 5:
+            break
+
+json_schemas = []
+for item in all_files_sorted:
+    rel = item["path"]
+    low = rel.lower()
+    if not low.endswith(".json") or item["size"] > 30 * 1024 or item["size"] == 0:
+        continue
+    if "/" not in rel or any(seg in f"/{low}" for seg in ("/templates/", "/submission/")):
+        try:
+            with open(os.path.join(root, rel), "r", encoding="utf-8", errors="replace") as fh:
+                obj = json.load(fh)
+            if isinstance(obj, dict):
+                json_schemas.append({"path": rel, "kind": "object", "keys": list(obj.keys())[:25]})
+            elif isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                json_schemas.append({"path": rel, "kind": f"list[{len(obj)}]", "keys": list(obj[0].keys())[:25]})
+        except Exception:
+            pass
+    if len(json_schemas) >= 3:
+        break
+
+spec_exts = (".pdf", ".docx", ".xlsx", ".xlsm", ".csv", ".sec", ".xml", ".md", ".txt")
+spec_files = []
+for item in all_files_sorted:
+    rel = item["path"]
+    low = rel.lower()
+    if low.startswith(("output/", "submission/")) or "template" in low or "/templates/" in f"/{low}":
+        continue
+    if low.endswith(spec_exts):
+        spec_files.append(rel)
+    if len(spec_files) >= 40:
+        break
+
+pkgs = {}
+for name in ("openpyxl", "ifcopenshell", "ezdxf", "pypdf", "docx", "pandas", "numpy", "scipy"):
+    try:
+        pkgs[name] = importlib.util.find_spec(name) is not None
+    except Exception:
+        pkgs[name] = False
+pkgs["libreoffice"] = bool(shutil.which("libreoffice") or shutil.which("soffice"))
+
+payload = {
+    "total_files": len(all_files_sorted),
+    "files": all_files_sorted[:160],
+    "templates": templates,
+    "json_schemas": json_schemas,
+    "spec_files": spec_files,
+    "packages": pkgs,
+}
+print("===RECON_START===")
+print(json.dumps(payload, ensure_ascii=False))
+print("===RECON_END===")
+__PLE_RECON__"""
+        try:
+            res = await self.session.exec(script, 20)
+        except Exception:
+            return ""
+        out = str(res.get("output") or "")
+        s_tag, e_tag = "===RECON_START===", "===RECON_END==="
+        si = out.find(s_tag)
+        ei = out.find(e_tag, si + len(s_tag)) if si != -1 else -1
+        if si == -1 or ei == -1:
+            return ""
+        try:
+            data = json.loads(out[si + len(s_tag) : ei].strip())
+        except ValueError:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+
+        files = data.get("files") or []
+        self._initial_files = {
+            posixpath.normpath(posixpath.join(self.session.workdir, str(f.get("path") or "")))
+            for f in files
+            if isinstance(f, dict) and f.get("path")
+        }
+        self._input_spec_files = [str(p) for p in (data.get("spec_files") or []) if p]
+        schemas: dict[str, dict[str, list[str]]] = {}
+        lines: list[str] = ["[WORKSPACE BRIEF — TURN 0]"]
+        lines.append(f"Workdir files ({data.get('total_files', len(files))} total):")
+        for f in files[:60]:
+            if isinstance(f, dict) and f.get("path"):
+                lines.append(f"  - {f['path']} ({f.get('size', 0)} B)")
+        if len(files) > 60:
+            lines.append(f"  ... (+{len(files) - 60} more files)")
+
+        templates = data.get("templates") or []
+        if templates:
+            lines.append("Starter XLSX template schemas (MUST clone in-place and preserve EVERY listed column):")
+            for tmpl in templates:
+                tpath = str(tmpl.get("path") or "")
+                tsheets = tmpl.get("sheets") or {}
+                if not tpath or not isinstance(tsheets, dict):
+                    continue
+                sheet_map: dict[str, list[str]] = {}
+                lines.append(f"  * {tpath}")
+                for sname, meta in tsheets.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    hdrs = [str(h) for h in (meta.get("headers") or []) if str(h).strip()]
+                    sheet_map[str(sname)] = hdrs
+                    samples = meta.get("col_a_samples") or []
+                    sample_txt = f" | colA={samples}" if samples else ""
+                    lines.append(f"    - Sheet '{sname}' (rows~{meta.get('rows', 0)}): headers={hdrs}{sample_txt}")
+                if sheet_map:
+                    schemas[tpath] = sheet_map
+        self._template_schemas = schemas
+
+        json_schemas = data.get("json_schemas") or []
+        if json_schemas:
+            lines.append("Starter JSON keys:")
+            for js in json_schemas:
+                lines.append(f"  - {js.get('path')} ({js.get('kind')}): keys={js.get('keys')}")
+
+        pkgs = data.get("packages") or {}
+        avail = [k for k, v in pkgs.items() if v]
+        missing = [k for k, v in pkgs.items() if not v]
+        if avail or missing:
+            lines.append(f"Container tools: available={avail}, missing={missing}")
+
+        brief = "\n".join(lines)
+        if len(brief) > 5500:
+            brief = brief[:5450] + "\n... [truncated]"
+        return "\n\n" + brief
 
     async def run(self) -> str:
         """Runs the coordinator loop until deliverable verification passes or stops cleanly."""
         mcp_note = await self.catalog.connect(self.session)
         self.tools = build_base_tools(self.config) + self.catalog.exposed_tools()
+        workspace_brief = await self._workspace_recon()
         left = self.session.time_left()
+        self._total_time_sec = left
         self.finish_margin = (
             float(self.config.reserve_verify_sec)
             if left is None
@@ -648,9 +939,9 @@ class EngineeringCoordinator:
                     minutes=int(left / 60) if left else "unlimited",
                 ),
             },
-            {"role": "user", "content": self.session.instruction},
+            {"role": "user", "content": (self.session.instruction or "") + workspace_brief},
         ]
-        nudges, head, repairs = 0, "", 0
+        nudges, head, repairs, progress_nudges, len_continues = 0, "", 0, 0, 0
         try:
             while True:
                 left = self.session.time_left()
@@ -673,40 +964,83 @@ class EngineeringCoordinator:
                 if reply.text or reply.calls:
                     self.messages.append(reply.message())
                 text = visible(head + reply.text)
-                if text:
+                leaked_xml = any(tok in (reply.text or "") for tok in ("<｜DSML｜", "<|DSML|>"))
+                if text and not leaked_xml and (reply.calls or not PREMATURE_NARRATION_RE.match(text) or len(text) >= 400):
                     self._last_durable_summary = text
                     self.session.final_message = text
 
                 if not reply.calls:
-                    if visible(reply.text) and reply.finish == "length":
-                        nudges, head = 0, head + reply.text
+                    if reply.finish == "length" and len_continues < MAX_LENGTH_CONTINUES:
+                        len_continues += 1
+                        nudges = 0
+                        if visible(reply.text) and not leaked_xml:
+                            head += reply.text
+                            msg = (
+                                f"Your reply hit the {self.max_output}-token output limit. Continue where it stopped "
+                                "and write long content to files via write_file or bash scripts."
+                            )
+                        else:
+                            await self._step_down_effort()
+                            msg = (
+                                f"Hidden reasoning consumed the {self.max_output}-token limit before emitting a tool call. "
+                                "Keep reasoning concise and immediately emit tool calls now."
+                            )
+                        self.messages.append({"role": "user", "content": msg})
+                        continue
+                    if leaked_xml and progress_nudges < MAX_PROGRESS_NUDGES and not self.usage_tracker.budget_exhausted():
+                        progress_nudges += 1
+                        nudges, head, len_continues = 0, "", 0
                         self.messages.append({
                             "role": "user",
-                            "content": (
-                                f"Your reply hit the {self.max_output}-token output limit. Continue where it stopped "
-                                "and write long content to files via write_file."
-                            ),
+                            "content": "Emit standard tool_calls, not raw XML/DSML tags.",
                         })
                         continue
                     if visible(reply.text):
+                        if (
+                            PREMATURE_NARRATION_RE.match(text)
+                            and len(text) < 400
+                            and progress_nudges < MAX_PROGRESS_NUDGES
+                            and not self.usage_tracker.budget_exhausted()
+                        ):
+                            progress_nudges += 1
+                            nudges, head, len_continues = 0, "", 0
+                            self.messages.append({
+                                "role": "user",
+                                "content": (
+                                    "Do not narrate next steps without tool calls. Execute the needed tool calls now "
+                                    "(`bash`, `write_file`, MCP) to produce and verify the deliverables."
+                                ),
+                            })
+                            continue
+                        if not self.touched_deliverables and progress_nudges < MAX_PROGRESS_NUDGES and not self.usage_tracker.budget_exhausted():
+                            gate_feedback = await self._pre_completion_gate(text)
+                            if gate_feedback:
+                                progress_nudges += 1
+                                nudges, head, len_continues = 0, "", 0
+                                self.messages.append({"role": "user", "content": gate_feedback})
+                                continue
                         if repairs < self.config.max_verify_repairs and not self.usage_tracker.budget_exhausted():
                             gate_feedback = await self._pre_completion_gate(text)
                             if gate_feedback:
                                 repairs += 1
-                                nudges, head = 0, ""
+                                nudges, head, len_continues = 0, "", 0
                                 self.messages.append({"role": "user", "content": gate_feedback})
                                 continue
                         return text or self._last_durable_summary or self.session.final_message
-                    if nudges >= 2:
+                    max_empty_nudges = MAX_PROGRESS_NUDGES if not self.touched_deliverables else 3
+                    if nudges >= max_empty_nudges:
                         return text or self._last_durable_summary or self.session.final_message
                     nudges += 1
                     self.messages.append({
                         "role": "user",
-                        "content": "Continue verification or finish with your verified summary and deliverable paths.",
+                        "content": (
+                            "No tool calls or deliverable were emitted. Call `bash` or `write_file` now to build "
+                            "and verify the requested deliverable, or return your final checked summary."
+                        ),
                     })
                     continue
 
-                nudges, head = 0, ""
+                nudges, head, len_continues = 0, "", 0
                 calls_list = list(reply.calls.values())
                 has_mcp_call = any(self.catalog.is_mcp_tool(c["name"]) for c in calls_list)
                 unqueried_mcp = bool(self.catalog.registry) and self.catalog.successful_calls == 0
@@ -763,12 +1097,16 @@ class EngineeringCoordinator:
                     self._pending_images.clear()
 
                 left = self.session.time_left()
+                extra_msg = ""
                 if left is not None:
-                    self.messages[-1]["content"] = (
-                        f"{self.messages[-1]['content']}\n[{int(left // 60)} minutes left]"
-                        if isinstance(self.messages[-1]["content"], str)
-                        else self.messages[-1]["content"]
-                    )
+                    extra_msg += f"\n[{int(left // 60)} minutes left]"
+                extra_msg += self._milestone_note(left)
+                if extra_msg:
+                    last_content = self.messages[-1]["content"]
+                    if isinstance(last_content, str):
+                        self.messages[-1]["content"] = last_content + extra_msg
+                    elif isinstance(last_content, list):
+                        last_content.append({"type": "text", "text": extra_msg.lstrip("\n")})
                 if self.prompt_tokens > self.compact_at():
                     await self.compact()
         except asyncio.CancelledError:
@@ -791,10 +1129,15 @@ class EngineeringCoordinator:
         issues: list[str] = []
         used_any_tool = any(m.get("role") == "tool" for m in self.messages)
         if self.catalog.registry and self.catalog.successful_calls == 0:
-            tools_hint = ", ".join(sorted(self.catalog.registry)[:6])
+            groups = sorted(self.catalog.service_groups().keys())
+            hint = (
+                ", ".join(groups[:10])
+                if len(self.catalog.registry) > self.config.mcp_direct_max_tools
+                else ", ".join(sorted(self.catalog.registry)[:6])
+            )
             issues.append(
-                f"Connected MCP tool(s) ({tools_hint}) have not returned a successful result yet. "
-                "Call the needed MCP tool directly now, read its output, and write/update deliverables with that exact output."
+                f"Connected MCP services ({hint}) have not been queried yet (0 successful MCP calls). "
+                "Use mcp_search_tools + mcp_call_tool (or direct MCP tools) to check case tracking, email, wiki, or portal records before finishing."
             )
         elif self.catalog.registry and self.catalog.successful_calls > 0 and not self._wrote_after_mcp and (
             m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or "")
@@ -804,19 +1147,22 @@ class EngineeringCoordinator:
                 f"No deliverable ({requested}) was written or updated after observing the MCP tool output. "
                 "Call write_file/edit_file with the exact observed MCP result before finishing."
             )
-        elif not self.touched_deliverables and (
-            m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or "")
-        ):
-            requested = ", ".join(sorted(set(m_deliv))[:4])
-            issues.append(
-                f"Requested deliverable file(s) ({requested}) have not been written on disk yet. "
-                "Use write_file or bash to create and verify the requested file(s) before finishing."
-            )
-        elif not used_any_tool and OUTPUT_PATH_RE.search(self.session.instruction or ""):
-            issues.append(
-                "No workspace tools have been called and no deliverable files were created on disk. "
-                "Execute tool calls (write_file, bash, read_file) to create and verify the requested deliverables."
-            )
+        if not self.touched_deliverables:
+            if m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or ""):
+                requested = ", ".join(sorted(set(m_deliv))[:4])
+                issues.append(
+                    f"Requested deliverable file(s) ({requested}) have not been written on disk yet. "
+                    "Use write_file or bash to create and verify the requested file(s) before finishing."
+                )
+            elif OUTPUT_PATH_RE.search(self.session.instruction or "") or re.search(
+                r"\b(memo|report|response|package|letter|workbook|spreadsheet|model)\b",
+                self.session.instruction or "",
+                re.I,
+            ):
+                issues.append(
+                    "No deliverable file has been written on disk yet. "
+                    "Create and verify the requested deliverable file(s) with write_file or bash before finishing—do not summarize unwritten files."
+                )
         if self.config.enable_evidence_ledger:
             conflicts = self.ledger.unresolved_conflicts()
             if conflicts:
@@ -840,6 +1186,13 @@ class EngineeringCoordinator:
                         f"{d.get('item')}: {d.get('earliest_suspect_dependency')}" for d in defects[:4]
                     )
                     issues.append(f"Cold-read audit failed for {path}: {detail or audit_res.get('error')}")
+        if not issues and len(self._input_spec_files) >= 2 and not self._spec_reads_seen and not self._spec_gate_fired and self.usage_tracker.calls <= 14:
+            self._spec_gate_fired = True
+            unread = ", ".join(self._input_spec_files[:6])
+            issues.append(
+                f"No project spec/criteria documents appear to have been parsed yet ({unread}). "
+                "Inspect the governing criteria/spec files with 1 concise batch Python script to verify parameters before finalizing."
+            )
         if not issues:
             return None
         return (
@@ -1158,16 +1511,45 @@ class EngineeringCoordinator:
             return clip(await fn(**args))
         except taskbridge.TaskError as exc:
             return f"error: {exc}"
-        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc:
             return f"error: {type(exc).__name__}: {exc}"
 
     def _resolve(self, path: str) -> str:
         return path if path.startswith("/") else posixpath.normpath(posixpath.join(self.session.workdir, path))
 
+    @staticmethod
+    def _is_readonly_path(low_norm: str) -> bool:
+        return any(part in low_norm for part in READONLY_PATH_PARTS) or "template" in posixpath.basename(low_norm)
+
+    def _mark_spec_read(self, text: str) -> None:
+        if self._spec_reads_seen or not text:
+            return
+        if SPEC_PARSER_RE.search(text):
+            self._spec_reads_seen = True
+            return
+        low = text.lower()
+        for rel in self._input_spec_files:
+            if rel.lower() in low or posixpath.basename(rel).lower() in low:
+                self._spec_reads_seen = True
+                return
+
     def _note_written_path(self, path: str, *, from_bash: bool = False) -> None:
-        self._write_seq += 1
         norm = self._resolve(path)
+        low = norm.lower()
+        is_scratch = low.startswith(("/tmp/", "/var/tmp/")) or "/work/" in low
+        is_readonly = self._is_readonly_path(low)
+        is_in_output = "/output/" in low or "/submission/" in low
+        if from_bash and (is_readonly or (norm in self._initial_files and not is_in_output)):
+            return
+        self._write_seq += 1
         self.touched_deliverables[norm] = self._write_seq
+        is_target = (
+            low.endswith(DELIVERABLE_EXTS)
+            or low.endswith("/solution.py")
+            or is_in_output
+        )
+        if is_target and not is_scratch and not is_readonly:
+            self.deliverable_files_written.add(norm)
         if self.catalog.successful_calls > 0:
             self._wrote_after_mcp = True
         if from_bash:
@@ -1180,6 +1562,7 @@ class EngineeringCoordinator:
         left = self.session.time_left()
         if left is not None:
             cap = min(cap, max(1, int(left - self.finish_margin)))
+        self._mark_spec_read(command)
         res = await self.session.exec(command, taskbridge.positive_int(timeout_sec, 120, cap))
         out = res.get("output") or ""
         if res.get("exit_code") == 0 and any(verb in command for verb in (">", "write", "save", "zip", "build", "render", ".py")):
@@ -1188,7 +1571,10 @@ class EngineeringCoordinator:
                 low_c = candidate.lower()
                 if low_c.startswith(("/tmp/", "/var/tmp/")):
                     continue
-                if any(part in low_c for part in ("/input/", "/inputs/", "/reference/", "/data/")):
+                if self._is_readonly_path(low_c):
+                    continue
+                is_in_output = "/output/" in low_c or "/submission/" in low_c
+                if candidate in self._initial_files and not is_in_output:
                     continue
                 if candidate not in self.touched_deliverables:
                     self._note_written_path(candidate, from_bash=True)
@@ -1199,7 +1585,9 @@ class EngineeringCoordinator:
         return f"exit code {res['exit_code']}{note}\n{out or '(no output)'}"
 
     async def _tool_read_file(self, path: str) -> str:
-        data = await self.session.read_file(self._resolve(path))
+        resolved = self._resolve(path)
+        self._mark_spec_read(resolved)
+        data = await self.session.read_file(resolved)
         if b"\0" in data[:8192]:
             return f"{path} is binary ({len(data)} bytes); inspect via bash or run_export_audit"
         return data.decode("utf-8", "replace") or "(empty file)"
@@ -1303,115 +1691,144 @@ class EngineeringCoordinator:
                 kind = "dxf"
             elif lower.endswith(".pdf"):
                 kind = "pdf"
+            elif lower.endswith(".py"):
+                kind = "python"
             elif lower.endswith((".docx", ".md", ".txt")):
                 kind = "decision_memo"
             else:
                 return {"ok": True, "path": resolved, "note": "no specialized binary verifier for extension", "defects": []}
 
-        if kind == "workbook":
-            res = audit_workbook_bytes(
-                raw,
-                required_items=required_items,
-                narrative_text=narr,
-                require_cached_formulas=bool(require_cached_formulas),
-            )
-            res["path"] = resolved
-            return res
-        if kind == "zip":
-            try:
-                res = audit_zip_deliverables(
+        if kind == "workbook" and not lower.endswith((".xlsx", ".xlsm")):
+            return {
+                "ok": False,
+                "path": resolved,
+                "error": f"path '{resolved}' is not an Excel workbook (.xlsx/.xlsm); retry with audit_kind='auto' or the matching format",
+                "defects": [],
+            }
+
+        try:
+            if kind == "python":
+                py_res = await self.session.exec(f"python3 -m py_compile {shlex.quote(resolved)}", 20)
+                ok_py = py_res.get("exit_code") == 0
+                defects_py = (
+                    []
+                    if ok_py
+                    else [{"code": "python_syntax_error", "severity": "blocker", "detail": (py_res.get("output") or "")[:300]}]
+                )
+                return {"ok": ok_py, "path": resolved, "defects": defects_py}
+            if kind == "workbook":
+                res = audit_workbook_bytes(
                     raw,
                     required_items=required_items,
+                    narrative_text=narr,
                     require_cached_formulas=bool(require_cached_formulas),
+                    template_schemas=self._template_schemas or None,
                 )
-            except zipfile.BadZipFile as exc:
-                return {"ok": False, "path": resolved, "error": f"invalid zip archive: {exc}", "defects": []}
-            defects = res.get("defects") or []
-            if audit_kind == "auto" and not res.get("ok") and defects and all(d.get("item") == "missing_xlsx" for d in defects):
-                with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
-                    entries = zf.namelist()
-                if entries:
-                    return {
-                        "ok": True,
-                        "path": resolved,
-                        "zip_entries": entries,
-                        "note": "zip archive opened cleanly (no xlsx present)",
-                        "defects": [],
-                    }
-            res["path"] = resolved
-            return res
-        if kind == "ifc":
-            req_ep = (
-                {svc: [tuple(float(c) for c in pt) for pt in pts] for svc, pts in required_endpoints.items()}
-                if isinstance(required_endpoints, dict)
-                else None
-            )
-            src_ep = (
-                {svc: tuple(float(c) for c in pt) for svc, pt in source_points.items()}
-                if isinstance(source_points, dict)
-                else None
-            )
-            ifc_res = audit_ifc4_bytes(
-                raw,
-                required_endpoints=req_ep,
-                source_points=src_ep,
-                forbidden_zones=forbidden_zones,
-            )
-            return {
-                "ok": ifc_res.ok,
-                "path": resolved,
-                "element_count": len(ifc_res.elements),
-                "cross_service_clashes": ifc_res.cross_service_clashes,
-                "same_service_clashes": ifc_res.same_service_clashes,
-                "clearance_violations": ifc_res.clearance_violations,
-                "unserved_endpoints": ifc_res.unserved_endpoints,
-                "forbidden_zone_violations": ifc_res.forbidden_zone_violations,
-                "min_cross_clearance": ifc_res.min_cross_clearance,
-                "total_route_length": ifc_res.total_route_length,
-                "defects": ifc_res.defects,
-            }
-        if kind == "dxf":
-            res = audit_dxf_bytes(
-                raw,
-                required_layers=required_layers,
-                required_text=required_text,
-            )
-            res["path"] = resolved
-            return res
-        if kind == "pdf":
-            res = audit_pdf_bytes(
-                raw,
-                required_terms=required_terms,
-                min_pages=max(1, int(min_pages or 1)),
-            )
-            res["path"] = resolved
-            return res
-        if kind == "decision_memo":
-            basename = posixpath.basename(lower)
-            has_memo_context = bool(
-                requested_date
-                or prerequisites is not None
-                or expected_work_package is not None
-                or "memo" in basename
-                or "permission" in basename
-            )
-            sections: tuple[str, ...] = (
-                ("decision", "scope", "prerequisite", "change")
-                if (audit_kind == "decision_memo" or has_memo_context)
-                else ()
-            )
-            return {
-                "path": resolved,
-                **audit_decision_memo(
+                res["path"] = resolved
+                return res
+            if kind == "zip":
+                try:
+                    res = audit_zip_deliverables(
+                        raw,
+                        require_xlsx=bool(required_items),
+                        required_items=required_items,
+                        require_cached_formulas=bool(require_cached_formulas),
+                        template_schemas=self._template_schemas or None,
+                    )
+                except zipfile.BadZipFile as exc:
+                    return {"ok": False, "path": resolved, "error": f"invalid zip archive: {exc}", "defects": []}
+                res["path"] = resolved
+                return res
+            if kind == "ifc":
+                req_ep = (
+                    {svc: [tuple(float(c) for c in pt) for pt in pts] for svc, pts in required_endpoints.items()}
+                    if isinstance(required_endpoints, dict)
+                    else None
+                )
+                src_ep = (
+                    {svc: tuple(float(c) for c in pt) for svc, pt in source_points.items()}
+                    if isinstance(source_points, dict)
+                    else None
+                )
+                ifc_res = audit_ifc4_bytes(
                     raw,
-                    is_docx=lower.endswith(".docx"),
-                    requested_date=requested_date,
-                    prerequisites=prerequisites,
-                    expected_work_package=expected_work_package,
-                    actual_work_package=actual_work_package,
-                    required_sections=sections,
-                ),
-            }
+                    required_endpoints=req_ep,
+                    source_points=src_ep,
+                    forbidden_zones=forbidden_zones,
+                )
+                ifc_defects = list(ifc_res.defects)
+                ifc_ok = bool(ifc_res.ok)
+                if hasattr(self.session, "exec"):
+                    probe_cmd = (
+                        "python3 -c \"import importlib.util, sys; spec = importlib.util.find_spec('ifcopenshell'); "
+                        "sys.exit(0) if not spec else __import__('ifcopenshell').open(sys.argv[1])\" "
+                        + shlex.quote(resolved)
+                    )
+                    probe = await self.session.exec(probe_cmd, 20)
+                    if probe.get("exit_code") != 0:
+                        ifc_ok = False
+                        ifc_defects.append({
+                            "code": "ifcopenshell_parse_failed",
+                            "severity": "blocker",
+                            "detail": (probe.get("output") or f"exit_code={probe.get('exit_code')}")[:300],
+                        })
+                return {
+                    "ok": ifc_ok,
+                    "path": resolved,
+                    "element_count": len(ifc_res.elements),
+                    "cross_service_clashes": ifc_res.cross_service_clashes,
+                    "same_service_clashes": ifc_res.same_service_clashes,
+                    "clearance_violations": ifc_res.clearance_violations,
+                    "unserved_endpoints": ifc_res.unserved_endpoints,
+                    "forbidden_zone_violations": ifc_res.forbidden_zone_violations,
+                    "min_cross_clearance": ifc_res.min_cross_clearance,
+                    "total_route_length": ifc_res.total_route_length,
+                    "defects": ifc_defects,
+                }
+            if kind == "dxf":
+                res = audit_dxf_bytes(
+                    raw,
+                    required_layers=required_layers,
+                    required_text=required_text,
+                )
+                res["path"] = resolved
+                return res
+            if kind == "pdf":
+                res = audit_pdf_bytes(
+                    raw,
+                    required_terms=required_terms,
+                    min_pages=max(1, int(min_pages or 1)),
+                )
+                res["path"] = resolved
+                return res
+            if kind == "decision_memo":
+                basename = posixpath.basename(lower)
+                has_memo_context = bool(
+                    requested_date
+                    or prerequisites is not None
+                    or expected_work_package is not None
+                    or "permission" in basename
+                    or "pto" in basename
+                )
+                sections: tuple[str, ...] = (
+                    ("decision", "scope", "prerequisite", "change")
+                    if (audit_kind == "decision_memo" or has_memo_context)
+                    else ()
+                )
+                return {
+                    "path": resolved,
+                    **audit_decision_memo(
+                        raw,
+                        is_docx=lower.endswith(".docx"),
+                        requested_date=requested_date,
+                        prerequisites=prerequisites,
+                        expected_work_package=expected_work_package,
+                        actual_work_package=actual_work_package,
+                        required_sections=sections,
+                    ),
+                }
+        except Exception as exc:
+            return {"ok": False, "path": resolved, "error": f"{kind} audit failed ({type(exc).__name__}): {exc}", "defects": []}
         return {"ok": False, "path": resolved, "error": f"unknown audit_kind {kind}", "defects": []}
 
     async def _tool_run_export_audit(self, path: str, **kwargs: Any) -> str:

@@ -1,0 +1,7 @@
+{
+  "path": "/filesystem/Thelbridge_Verification_Memo_Item048_BlockB.docx",
+  "ok": true,
+  "text_length": 6550,
+  "derived_decision": null,
+  "defects": []
+}

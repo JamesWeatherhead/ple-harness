@@ -216,12 +216,16 @@ class MCPCatalog:
                     "and only then call `write_file` or `edit_file` with that exact returned value."
                 )
 
-        # On-demand mode: concise server summary only, full schemas fetched lazily
+        # On-demand mode: concise server summary + service groups, schemas fetched lazily
+        groups = self.service_groups()
+        group_text = ", ".join(f"{g} ({len(v)})" for g, v in sorted(groups.items())[:24])
         return (
             "\n\nThe task provides local MCP application services:\n"
             + "\n".join(summary_lines)
-            + "\nUse `mcp_list_servers`, `mcp_search_tools`, `mcp_get_tool_schema`, and `mcp_call_tool` "
-            "to discover schemas on demand, and await the returned MCP observation before writing files."
+            + (f"\nAvailable MCP service groups: {group_text}." if group_text else "")
+            + "\nIMPORTANT: Case tracking, email/correspondence, calendars, wikis, databases, and shared document portals "
+            "live in these MCP services (not just local files). Use `mcp_search_tools(query=\"<service or keyword>\")` "
+            "early to inspect matching tools and parameter schemas, then call `mcp_call_tool` and await results before finalizing."
         )
 
     def exposed_tools(self) -> list[dict[str, Any]]:
@@ -240,6 +244,27 @@ class MCPCatalog:
             "mcp_call_tool",
         } or tool_name in self.registry
 
+    def service_groups(self, server: str = "") -> dict[str, list[str]]:
+        """Groups registered MCP tool names by application service prefix."""
+        groups: dict[str, list[str]] = {}
+        for name, (srv, t) in self.registry.items():
+            if server and srv.name != server:
+                continue
+            raw = str(t.get("name", ""))
+            parts = [p for p in raw.split("_") if p]
+            if len(parts) >= 3 and parts[0] == "wiki" and parts[1] == "js":
+                prefix = "_".join(parts[:3])
+            elif len(parts) >= 2 and parts[1] in ("mcp", "v2", "js", "browser"):
+                prefix = f"{parts[0]}_{parts[1]}"
+            elif parts:
+                prefix = parts[0]
+            else:
+                prefix = srv.name
+            groups.setdefault(prefix, []).append(name)
+        for tools_list in groups.values():
+            tools_list.sort()
+        return groups
+
     def list_servers(self, server: str = "", offset: int = 0, limit: int = 40) -> str:
         limit = max(1, min(100, int(limit or 40)))
         offset = max(0, int(offset or 0))
@@ -255,6 +280,7 @@ class MCPCatalog:
         return json.dumps(
             {
                 "servers": {s: len(srv.tools) for s, srv in self.servers.items()},
+                "service_groups": {g: len(v) for g, v in sorted(self.service_groups(server).items())},
                 "filter_server": server or None,
                 "total_tools": len(names),
                 "offset": offset,
@@ -310,20 +336,30 @@ class MCPCatalog:
             return json.dumps({"total_matches": 0, "matches": [], "hint": "Try mcp_list_servers for exact names."})
 
         page = matched[offset : offset + limit]
+        matches_out: list[dict[str, Any]] = []
+        for name, srv, t in page:
+            raw_schema = t.get("inputSchema") or {}
+            params = {k: v for k, v in raw_schema.items() if k != "$schema"} or {
+                "type": "object",
+                "properties": {},
+            }
+            item: dict[str, Any] = {
+                "tool": name,
+                "server": srv.name,
+                "description": (t.get("description") or t["name"])[:220],
+                "required_args": list(params.get("required") or []),
+                "arg_names": list((params.get("properties") or {}).keys())[:16],
+            }
+            if len(page) <= 8 and len(json.dumps(params, separators=(",", ":"))) <= 1200:
+                item["parameters"] = params
+            matches_out.append(item)
         return json.dumps(
             {
                 "total_matches": len(matched),
                 "offset": offset,
                 "limit": limit,
                 "next_offset": offset + len(page) if offset + len(page) < len(matched) else None,
-                "matches": [
-                    {
-                        "tool": name,
-                        "server": srv.name,
-                        "description": (t.get("description") or t["name"])[:220],
-                    }
-                    for name, srv, t in page
-                ],
+                "matches": matches_out,
             },
             indent=2,
         )

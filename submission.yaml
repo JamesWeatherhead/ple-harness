@@ -13,15 +13,16 @@
 # limitations under the License.
 
 name: ple-harness
-model_api: google-cloud/gemini-4-neon
+model_api: google-cloud/gpt-oss-120b
 install: >-
   uv venv --python 3.12 /opt/harness/venv
   && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt
 serve: /opt/harness/venv/bin/python {src}/serve.py
 env:
-  COMPACT_AT_TOKENS: "140000"
-  MAX_OUTPUT_TOKENS: "32000"
-  MAX_MODEL_CALLS: "0"
+  COMPACT_AT_TOKENS: "90000"
+  MAX_OUTPUT_TOKENS: "8192"
+  MAX_MODEL_CALLS: "60"
+  REASONING_EFFORT: "medium"
   RESERVE_VERIFY_SEC: "150"
   BUDGET_CAP_USD: "0"
   MCP_DISCOVERY_MODE: "ondemand"
@@ -29,5 +30,7 @@ env:
   ENABLE_EVIDENCE_LEDGER: "true"
   ENABLE_EXPORT_VERIFIER: "true"
   ENABLE_INCUMBENT_RETENTION: "true"
+  ENABLE_MILESTONE_GUARD: "true"
+  ENABLE_WORKSPACE_RECON: "true"
   ENABLE_IMAGE_INPUT: "false"
   MAX_VERIFY_REPAIRS: "2"

@@ -333,3 +333,55 @@ def test_ple_evidence_units_and_summary_markdown() -> None:
     assert "1 superseded" in md
     assert "Unresolved Conflicts" in md
     assert "beam_load" in md
+
+
+def test_zip_recursive_multitype_and_placeholder_audit() -> None:
+    """Tests empty zip, 0-byte member, multi-xlsx formula check, PDF/DXF recursion, and placeholder detection."""
+    empty_buf = io.BytesIO()
+    with zipfile.ZipFile(empty_buf, "w", zipfile.ZIP_DEFLATED):
+        pass
+    empty_res = audit_zip_deliverables(empty_buf.getvalue())
+    assert empty_res["ok"] is False
+    assert any(d["item"] == "zip_empty" for d in empty_res["defects"])
+
+    zero_buf = io.BytesIO()
+    with zipfile.ZipFile(zero_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("report.md", b"")
+    zero_res = audit_zip_deliverables(zero_buf.getvalue(), require_xlsx=False)
+    assert zero_res["ok"] is False
+    assert any(d["item"] == "empty_zip_member:report.md" for d in zero_res["defects"])
+
+    # Multi-xlsx + placeholder detection + invalid PDF member inside zip
+    xlsx_good, good_md, _ = _build_mv_bundle()
+    wb_bad = openpyxl.Workbook()
+    ws_bad = wb_bad.active
+    ws_bad["A1"] = "=1/0"
+    ws_bad["A2"] = "#DIV/0!"
+    ws_bad["B1"] = "Status: iteration-1 provisional pending final check"
+    bad_xlsx_buf = io.BytesIO()
+    wb_bad.save(bad_xlsx_buf)
+
+    mixed_buf = io.BytesIO()
+    with zipfile.ZipFile(mixed_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("study.xlsx", xlsx_good)
+        zf.writestr("backup_schedule.xlsx", bad_xlsx_buf.getvalue())
+        zf.writestr("notes.md", "No TBD values in Section 1.\nOpen item: TBD\n")
+        zf.writestr("drawing_pkg.pdf", b"not a valid pdf")
+    mixed_res = audit_zip_deliverables(mixed_buf.getvalue(), require_cached_formulas=True)
+    assert mixed_res["ok"] is False
+    defect_items = {d["item"] for d in mixed_res["defects"]}
+    assert "workbook_formula_errors" in defect_items
+    assert "placeholder_marker:notes.md" in defect_items
+    assert "placeholder_marker:backup_schedule.xlsx" in defect_items
+    assert "pdf_parse" in defect_items
+
+    # Negated placeholder prose + clean xlsx + non-empty clean report should pass
+    clean_buf = io.BytesIO()
+    with zipfile.ZipFile(clean_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("conveyance_study.xlsx", xlsx_good)
+        zf.writestr("conveyance_study_report.md", good_md + "\nZero placeholders or TBD items remain.\n")
+    clean_res = audit_zip_deliverables(clean_buf.getvalue(), require_cached_formulas=True)
+    assert clean_res["ok"] is True
+    assert clean_res["audited_xlsx"] == "conveyance_study.xlsx"
+    assert clean_res["audited_xlsx_list"] == ["conveyance_study.xlsx"]
+
