@@ -10,7 +10,7 @@
 
 Most agent harnesses treat engineering failures as model reasoning deficits—assuming that shell access, eager tool schemas, and aggressive `50k` compaction suffice. Across 29 public dev tasks under locked Stage-2 `google-cloud/gpt-oss-120b` pricing (`$0.09/$0.36` per 1M tokens; `deepseek/deepseek-v4.1-flash` local judge), paired runs contradict that assumption: a capped starter baseline (`0.065`, `$0.033/task`, `1.09 min/task`) drops `2/29` tasks empty (`27/29` usable), breaks Excel parsers (`parse_ok=False`), crashes IFC4 scripts (`ERR_EXEC`), collapses on 353-tool MCP portals, and thrashes under `50k` compaction.
 
-`ple-harness` v3.0 ([`serve.py`](serve.py) + [`harness.py`](harness.py)) eliminates empty exports (**`29/29` usable**) and all parse/script crashes, fixes Cluster-A blind-MCP collapse (`0.015 -> 0.118`), and lifts `google-cloud/gemini-3.8-flash` on `PROBE3` from **`0.000` (`0/3`) to `0.153` (`3/3`)**. On our targeted 5-task A/B slice, removing v2.1's non-MCP-turn write blocking, adding LibreOffice formula recalculation, tightening IFC4/XLSX cold-read audits, and inserting a fresh-context PE reviewer lifted `gpt-oss-120b` **`+69.1%` relative to v2.1 (`0.042 -> 0.070`)**, bringing the 29-task artifact snapshot to **`0.046` (`$0.075/task`, `1.70 min/task`, `29/29` usable)**. For Stage 2, [`submission.yaml`](submission.yaml) upgrades to **`google-cloud/gemini-4-neon`** (`high`, `220k` compaction, `32k` output, `300s` verify reserve, vision enabled, independent PE reviewer enabled, uncapped calls/USD); as disclosed below, the committed [`artifacts/`](artifacts/manifest.json) bundle was generated locally on `gpt-oss-120b` (`deepseek/deepseek-v4.1-flash` judge) prior to switching `model_api` to `gemini-4-neon`.
+`ple-harness` v3.0 ([`serve.py`](serve.py) + [`harness.py`](harness.py)) eliminates empty exports (**`29/29` usable**) and all parse/script crashes, fixes Cluster-A blind-MCP collapse (`0.015 -> 0.118`), and lifts `google-cloud/gemini-3.8-flash` on `PROBE3` from **`0.000` (`0/3`) to `0.153` (`3/3`)**. On our targeted 5-task A/B slice, removing v2.1's non-MCP-turn write blocking, adding LibreOffice formula recalculation, tightening IFC4/XLSX cold-read audits, and inserting a fresh-context PE reviewer lifted `gpt-oss-120b` **`+69.1%` relative to v2.1 (`0.042 -> 0.070`)**, bringing the 29-task artifact snapshot to **`0.046` (`$0.075/task`, `1.70 min/task`, `29/29` usable)**. For Stage 2, [`submission.yaml`](submission.yaml) upgrades to **`google-cloud/gemini-4-neon`** (`high`, `220k` compaction, `16k` output, `300s` verify reserve, vision enabled, independent PE reviewer enabled, uncapped calls/USD); as disclosed below, the committed [`artifacts/`](artifacts/manifest.json) bundle was generated locally on `gpt-oss-120b` (`deepseek/deepseek-v4.1-flash` judge) prior to switching `model_api` to `gemini-4-neon`.
 
 ---
 
@@ -19,7 +19,7 @@ Most agent harnesses treat engineering failures as model reasoning deficits—as
 ```mermaid
 flowchart LR
     EVAL["Evaluator / taskbridge v1<br/>(WebSocket /eval, 6h limit)"] --> RECON["Turn-0 Workspace Recon<br/>(Files, XLSX Templates, Solvers)"]
-    RECON --> LOOP["Coordinator Loop (gemini-4-neon)<br/>(220k Compact, 32k Out, High Effort,<br/>read_image + 400 fallback)"]
+    RECON --> LOOP["Coordinator Loop (gemini-4-neon)<br/>(220k Compact, 16k Out, High Effort,<br/>read_image + 400 fallback)"]
     LOOP <-->|"HTTPS_PROXY<br/>(400 / Retry / effort / merged)"| LLM["Model Endpoint<br/>(google-cloud/gemini-4-neon)"]
     LOOP -->|"<=8 tools: Direct<br/>>8 tools: service_groups() + search"| MCP["MCPCatalog<br/>(One-Shot Nudge + Same-Turn Defer)"]
     LOOP --> TOOLS["Container Tools<br/>(bash, file I/O, EvidenceLedger,<br/>LibreOffice XLSX recalc, SciPy/ezdxf/ifcopenshell)"]
@@ -159,7 +159,7 @@ uv run python eval/run.py ../ple-harness --env-file openrouter.env
 | Variable | Value | Effect |
 |---|---:|---|
 | `COMPACT_AT_TOKENS` | `"220000"` | Context threshold triggering trimming & `SUMMARY_PROMPT` compaction (`220k` on 1M-context models; `90k` otherwise) |
-| `MAX_OUTPUT_TOKENS` | `"32000"` | Max completion tokens per LLM call (auto-shrunk on `400` context errors) |
+| `MAX_OUTPUT_TOKENS` | `"16384"` | Max completion tokens per LLM call (auto-shrunk on `400` context errors) |
 | `MAX_MODEL_CALLS` | `"0"` | Uncapped model calls inside the 6-hour Stage-2 container (`"0"` = unlimited) |
 | `REASONING_EFFORT` | `"high"` | Frontier reasoning level (auto-stepped down or dropped on `400`) |
 | `RESERVE_VERIFY_SEC` | `"300"` | Wall-clock margin reserved before timeout for audit, PE review & `finish()` |
