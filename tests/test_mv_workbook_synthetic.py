@@ -385,3 +385,83 @@ def test_zip_recursive_multitype_and_placeholder_audit() -> None:
     assert clean_res["audited_xlsx"] == "conveyance_study.xlsx"
     assert clean_res["audited_xlsx_list"] == ["conveyance_study.xlsx"]
 
+
+def test_workbook_excel_error_coords_and_blank_template_calc_sheet() -> None:
+    """Tests per-cell Excel error coordinates and blank/all-zero template summary sheet detection."""
+    wb = openpyxl.Workbook()
+    ws_reg = wb.active
+    ws_reg.title = "ConstraintRegister"
+    ws_reg.append(["ConstraintID", "Requirement"])
+    ws_reg.append(["C-01", "Asce 7-22 roof snow load"])
+
+    ws_calc = wb.create_sheet("CalcSummary")
+    ws_calc.append(["Zone", "Demand_psf", "Capacity_psf"])
+
+    ws_diaph = wb.create_sheet("Diaphragm")
+    ws_diaph.append(["Zone", "Shear_plf", "Utilization"])
+    ws_diaph.append(["Z1", 0.0, 0.0])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    tmpl = {
+        "templates/roof_TEMPLATE.xlsx": {
+            "ConstraintRegister": ["ConstraintID", "Requirement"],
+            "CalcSummary": ["Zone", "Demand_psf", "Capacity_psf"],
+            "Diaphragm": ["Zone", "Shear_plf", "Utilization"],
+        }
+    }
+    res_bad = audit_workbook_bytes(buf.getvalue(), template_schemas=tmpl)
+    assert res_bad["ok"] is False
+    items = {d["item"] for d in res_bad["defects"]}
+    assert "blank_template_sheet:CalcSummary" in items
+    assert "blank_template_sheet:Diaphragm" in items
+
+    # Now populate both sheets cleanly, and also verify #DIV/0! coordinate error on a separate copy
+    ws_calc.append(["Z1", 43.66, 120.0])
+    ws_diaph["B2"] = 185.0
+    ws_diaph["C2"] = 0.62
+    buf_ok = io.BytesIO()
+    wb.save(buf_ok)
+    res_ok = audit_workbook_bytes(buf_ok.getvalue(), template_schemas=tmpl)
+    assert res_ok["ok"] is True, res_ok["defects"]
+
+    ws_calc["B3"] = "#DIV/0!"
+    buf_err = io.BytesIO()
+    wb.save(buf_err)
+    res_err = audit_workbook_bytes(buf_err.getvalue(), template_schemas=tmpl)
+    assert res_err["ok"] is False
+    err_items = {d["item"] for d in res_err["defects"]}
+    assert "workbook_formula_errors" in err_items
+    assert "excel_formula_error:CalcSummary!B3" in err_items
+
+
+def test_v3_recalc_workbook_helper_skips_xlsm_and_recalcs_uncached_xlsx() -> None:
+    """Tests LibreOffice recalc guard skips .xlsm/cached files and triggers on uncached .xlsx formulas."""
+    exec_calls: list[str] = []
+
+    class _RecalcSession(_InMemorySession):
+        async def exec(self, command: str, timeout_sec: int = 120):
+            exec_calls.append(command)
+            return {"exit_code": 0, "output": "", "timed_out": False}
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = 10
+    ws["B1"] = "=A1*2"
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    async def scenario() -> None:
+        sess = _RecalcSession()
+        coord = EngineeringCoordinator(sess, config=RuntimeConfig.from_env())
+        coord._has_libreoffice = True
+        await sess.write_file("/workspace/out.xlsm", buf.getvalue())
+        await coord._recalc_workbook_if_needed("/workspace/out.xlsm", buf.getvalue())
+        assert exec_calls == []
+
+        await sess.write_file("/workspace/out.xlsx", buf.getvalue())
+        await coord._recalc_workbook_if_needed("/workspace/out.xlsx", buf.getvalue())
+        assert len(exec_calls) == 1 and "libreoffice --headless --convert-to xlsx" in exec_calls[0]
+
+    asyncio.run(scenario())
+

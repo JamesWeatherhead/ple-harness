@@ -1203,3 +1203,257 @@ def test_pre_completion_gate_surfaces_both_mcp_groups_and_missing_deliverable(mo
     assert "mail" in gate_msg
     assert "No deliverable file has been written on disk yet" in gate_msg
 
+
+def test_v3_mcp_nonblocking_write_and_oneshot_nudge(monkeypatch: Any) -> None:
+    """Tests that standalone write_file is never blocked when MCP has 0 calls and MCP gate fires only once."""
+    sys.path.insert(0, str(ROOT))
+    import harness
+    import openai
+
+    sess = _make_multiservice_mcp_session()
+    sess.fs: dict[str, bytes] = {}
+
+    async def write_file(path: str, data: str | bytes, append: bool = False) -> int:
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        sess.fs[path] = raw
+        return len(raw)
+
+    async def read_file(path: str) -> bytes:
+        return sess.fs[path]
+
+    sess.write_file = write_file
+    sess.read_file = read_file
+
+    seen_reqs: list[dict] = []
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        seen_reqs.append(body)
+        if idx == 0:
+            # Standalone write_file without calling MCP -> must NOT be deferred in v3.0
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_w_direct",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": '{"path":"/filesystem/memo.md","content":"Complete technical memo draft."}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 20}),
+            ])
+        elif idx == 1:
+            # Verify write_file succeeded immediately
+            tool_msgs = [m for m in body["messages"] if m.get("role") == "tool"]
+            assert any("now holds" in str(m.get("content")) for m in tool_msgs)
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Memo written on disk."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 60, "completion_tokens": 10}),
+            ])
+        else:
+            # One-shot MCP reminder fired once -> even if model still finishes without MCP, loop accepts instead of stalling
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Final memo confirmed without redundant MCP churn."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 70, "completion_tokens": 10}),
+            ])
+
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_NAME", "google-cloud/gpt-oss-120b")
+    monkeypatch.setenv("ENABLE_INDEPENDENT_REVIEWER", "false")
+    with _MockOpenAIServer(handle) as oai:
+        cfg = harness.RuntimeConfig.from_env()
+        client = openai.AsyncOpenAI(base_url=oai.url, api_key="test-key")
+        coord = harness.EngineeringCoordinator(sess, config=cfg, client=client)
+        out = asyncio.run(coord.run())
+        assert "Final memo confirmed" in out
+        assert coord._mcp_nudge_fired is True
+        assert sess.fs["/filesystem/memo.md"] == b"Complete technical memo draft."
+        assert len(seen_reqs) == 3
+
+
+def test_v3_independent_pe_reviewer_catches_defect_and_approves(monkeypatch: Any) -> None:
+    """Tests fresh-context PE reviewer finding a defect, coordinator fixing it, and reviewer approving PASS."""
+    sys.path.insert(0, str(ROOT))
+    import harness
+    import openai
+
+    class _ReviewSession:
+        workdir = "/workspace"
+        instruction = "Produce /workspace/design.md with Load Factor >= 1.5."
+        mcp_servers: list[dict] = []
+        limits = {"exec_timeout_sec": 60}
+        final_message = ""
+        fs: dict[str, bytes] = {}
+
+        def time_left(self) -> float:
+            return 3600.0
+
+        async def log(self, text: str) -> None:
+            return None
+
+        async def usage(self, model: str, i: int, o: int, c: int) -> None:
+            return None
+
+        async def exec(self, command: str, timeout_sec: int = 120) -> dict[str, Any]:
+            return {"exit_code": 0, "output": "ok", "timed_out": False}
+
+        async def read_file(self, path: str) -> bytes:
+            return self.fs[path]
+
+        async def write_file(self, path: str, data: str | bytes, append: bool = False) -> int:
+            raw = data.encode("utf-8") if isinstance(data, str) else data
+            self.fs[path] = raw
+            return len(raw)
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        sys_msg = (body.get("messages") or [{}])[0].get("content", "")
+        is_reviewer = "Senior Principal Engineer" in sys_msg
+        if not is_reviewer:
+            if idx == 0:
+                _MockOpenAIServer.send_sse(h, [
+                    _sse_chunk({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "w1",
+                            "type": "function",
+                            "function": {"name": "write_file", "arguments": '{"path":"/workspace/design.md","content":"Load Factor: 1.1"}'},
+                        }],
+                    }),
+                    _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 50, "completion_tokens": 15}),
+                ])
+            elif idx == 1:
+                _MockOpenAIServer.send_sse(h, [
+                    _sse_chunk({"role": "assistant", "content": "Initial design written."}),
+                    _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 60, "completion_tokens": 10}),
+                ])
+            elif idx == 4:
+                # Fix defect flagged by reviewer
+                _MockOpenAIServer.send_sse(h, [
+                    _sse_chunk({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "w2",
+                            "type": "function",
+                            "function": {"name": "write_file", "arguments": '{"path":"/workspace/design.md","content":"Load Factor: 1.65 (PASS)"}'},
+                        }],
+                    }),
+                    _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 90, "completion_tokens": 15}),
+                ])
+            else:
+                _MockOpenAIServer.send_sse(h, [
+                    _sse_chunk({"role": "assistant", "content": "Updated Load Factor to 1.65."}),
+                    _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 100, "completion_tokens": 10}),
+                ])
+        else:
+            # Reviewer: inspect file once, flag 1.1 -> later approve PASS when updated to 1.65
+            tool_msgs = [m for m in body["messages"] if m.get("role") == "tool"]
+            if not tool_msgs:
+                _MockOpenAIServer.send_sse(h, [
+                    _sse_chunk({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": f"rev_r_{idx}",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":"/workspace/design.md"}'},
+                        }],
+                    }),
+                    _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 40, "completion_tokens": 12}),
+                ])
+            elif "1.65" in str(tool_msgs[-1].get("content")):
+                _MockOpenAIServer.send_sse(h, [
+                    _sse_chunk({"role": "assistant", "content": "PASS"}),
+                    _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 60, "completion_tokens": 5}),
+                ])
+            else:
+                _MockOpenAIServer.send_sse(h, [
+                    _sse_chunk({"role": "assistant", "content": "1. /workspace/design.md Load Factor is 1.1 (< 1.5 required)."}),
+                    _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 60, "completion_tokens": 15}),
+                ])
+
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_NAME", "google-cloud/gemini-4-neon")
+    monkeypatch.setenv("ENABLE_INDEPENDENT_REVIEWER", "true")
+    monkeypatch.setenv("MAX_REVIEW_ROUNDS", "2")
+    with _MockOpenAIServer(handle) as oai:
+        cfg = harness.RuntimeConfig.from_env()
+        client = openai.AsyncOpenAI(base_url=oai.url, api_key="test-key")
+        sess = _ReviewSession()
+        coord = harness.EngineeringCoordinator(sess, config=cfg, client=client)
+        out = asyncio.run(coord.run())
+        assert "1.65" in out
+        assert b"1.65" in sess.fs["/workspace/design.md"]
+
+
+def test_v3_image_input_auto_fallback_on_400(monkeypatch: Any) -> None:
+    """Tests drop_image_input strips image_url and removes read_image when endpoint rejects vision."""
+    sys.path.insert(0, str(ROOT))
+    import harness
+    import openai
+
+    tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+
+    class _ImgSession:
+        workdir = "/workspace"
+        instruction = "Check drawing.png and finish."
+        mcp_servers: list[dict] = []
+        limits = {"exec_timeout_sec": 60}
+        final_message = ""
+        fs: dict[str, bytes] = {"/workspace/drawing.png": tiny_png}
+
+        def time_left(self) -> float:
+            return 200.0
+
+        async def log(self, text: str) -> None:
+            return None
+
+        async def usage(self, model: str, i: int, o: int, c: int) -> None:
+            return None
+
+        async def read_file(self, path: str) -> bytes:
+            return self.fs[path]
+
+        async def write_file(self, path: str, data: str | bytes, append: bool = False) -> int:
+            raw = data.encode("utf-8") if isinstance(data, str) else data
+            self.fs[path] = raw
+            return len(raw)
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        if idx == 0:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "img1",
+                        "type": "function",
+                        "function": {"name": "read_image", "arguments": '{"path":"/workspace/drawing.png"}'},
+                    }],
+                }),
+                _sse_chunk({}, finish_reason="tool_calls", usage={"prompt_tokens": 40, "completion_tokens": 12}),
+            ])
+        elif idx == 1:
+            _MockOpenAIServer.send_json(h, 400, {"error": {"message": "This model does not support image_url inputs"}})
+        else:
+            tool_names = [t["function"]["name"] for t in body.get("tools") or []]
+            assert "read_image" not in tool_names
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Fallback text parsing completed."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 50, "completion_tokens": 10}),
+            ])
+
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_NAME", "google-cloud/gpt-oss-120b")
+    monkeypatch.setenv("ENABLE_IMAGE_INPUT", "true")
+    monkeypatch.setenv("ENABLE_INDEPENDENT_REVIEWER", "false")
+    with _MockOpenAIServer(handle) as oai:
+        cfg = harness.RuntimeConfig.from_env()
+        client = openai.AsyncOpenAI(base_url=oai.url, api_key="test-key")
+        coord = harness.EngineeringCoordinator(_ImgSession(), config=cfg, client=client)
+        out = asyncio.run(coord.run())
+        assert "Fallback text parsing completed." in out
+        assert coord._image_input_disabled is True
+        assert all(t["function"]["name"] != "read_image" for t in coord.tools)
+

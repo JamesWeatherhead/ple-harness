@@ -344,6 +344,7 @@ def audit_workbook_bytes(
     wb_v = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
 
     formula_errors: list[dict[str, Any]] = []
+    seen_error_coords: set[tuple[str, int, int]] = set()
     uncached_formulas: list[str] = []
     circular_refs: list[str] = []
     verified_cache: dict[tuple[str, int, int], float] = {}
@@ -356,7 +357,15 @@ def audit_workbook_bytes(
                 vv = ws_v.cell(r, c).value
                 for check_val in (fv, vv):
                     if isinstance(check_val, str) and any(tok in check_val for tok in ERROR_TOKENS):
-                        formula_errors.append({"sheet": sname, "row": r, "col": c, "value": check_val})
+                        if (sname, r, c) not in seen_error_coords:
+                            seen_error_coords.add((sname, r, c))
+                            formula_errors.append({
+                                "sheet": sname,
+                                "row": r,
+                                "col": c,
+                                "coord": f"{get_column_letter(c)}{r}",
+                                "value": check_val,
+                            })
                 if isinstance(fv, str) and fv.startswith("="):
                     if vv is None:
                         uncached_formulas.append(f"{sname}!R{r}C{c}")
@@ -382,6 +391,18 @@ def audit_workbook_bytes(
                 earliest_suspect_dependency=f"{formula_errors[0]['sheet']} row {formula_errors[0]['row']}: {formula_errors[0]['value']}",
             )
         )
+        for err in formula_errors[:10]:
+            defects.append(
+                make_defect(
+                    item=f"excel_formula_error:{err['sheet']}!{err['coord']}",
+                    requirement_source="XLSX cell formula integrity",
+                    measured=err["value"],
+                    limit="no Excel error token",
+                    tolerance=0,
+                    earliest_suspect_dependency=f"Fix broken formula/reference at {err['sheet']}!{err['coord']} ({err['value']})",
+                    severity="blocker",
+                )
+            )
 
     if circular_refs:
         defects.append(
@@ -467,6 +488,77 @@ def audit_workbook_bytes(
                                 f"a copy of '{best_tmpl_name}' in-place"
                             ),
                             severity="blocker",
+                        )
+                    )
+
+            if len(best_tmpl_sheets) > 1:
+                skip_sheet_re = re.compile(r"(instruction|readme|overview|cover|guide|legend|notes?)", re.I)
+                calc_sheet_re = re.compile(r"(calc|summary|design|diaphragm|schedule|sizing|demand|load|takeoff|result)", re.I)
+                checked_sheets: list[str] = []
+                blank_calc_sheets: list[tuple[str, str]] = []
+                all_blank_or_zero = True
+                for req_sheet, req_cols in best_tmpl_sheets.items():
+                    if req_sheet not in wb_f.sheetnames or len(req_cols) < 2 or skip_sheet_re.search(req_sheet):
+                        continue
+                    checked_sheets.append(req_sheet)
+                    ws_t = wb_f[req_sheet]
+                    ws_tv = wb_v[req_sheet]
+                    header_row = 1
+                    best_hdr_hits = 0
+                    req_set = set(req_cols)
+                    for rr in range(1, min(6, ws_t.max_row + 1)):
+                        row_strs = {
+                            str(v).strip()
+                            for cc in range(1, ws_t.max_column + 1)
+                            for v in (ws_t.cell(rr, cc).value, ws_tv.cell(rr, cc).value)
+                            if v is not None and str(v).strip()
+                        }
+                        hits = len(row_strs & req_set)
+                        if hits > best_hdr_hits:
+                            best_hdr_hits = hits
+                            header_row = rr
+                    has_data_row = False
+                    numeric_vals: list[float] = []
+                    has_uncached_formula = False
+                    for rr in range(header_row + 1, ws_t.max_row + 1):
+                        for cc in range(1, ws_t.max_column + 1):
+                            fv_c = ws_t.cell(rr, cc).value
+                            vv_c = ws_tv.cell(rr, cc).value
+                            if fv_c is not None and str(fv_c).strip() != "":
+                                has_data_row = True
+                            elif vv_c is not None and str(vv_c).strip() != "":
+                                has_data_row = True
+                            if cc >= 2:
+                                val_pick = vv_c if vv_c is not None else fv_c
+                                if isinstance(val_pick, (int, float)) and not isinstance(val_pick, bool):
+                                    numeric_vals.append(float(val_pick))
+                                elif isinstance(fv_c, str) and fv_c.strip().startswith("=") and vv_c is None:
+                                    has_uncached_formula = True
+                    is_all_zero_num = (
+                        len(numeric_vals) >= 2
+                        and not has_uncached_formula
+                        and all(abs(x) <= 1e-12 for x in numeric_vals)
+                    )
+                    if not has_data_row:
+                        blank_calc_sheets.append((req_sheet, "no data rows below header"))
+                    elif is_all_zero_num:
+                        blank_calc_sheets.append((req_sheet, "all numeric calculation cells are 0"))
+                    else:
+                        all_blank_or_zero = False
+                for sh_name, reason in blank_calc_sheets:
+                    is_hard = bool(calc_sheet_re.search(sh_name)) or (len(checked_sheets) >= 2 and all_blank_or_zero)
+                    target = defects if is_hard else warnings
+                    target.append(
+                        make_defect(
+                            item=f"blank_template_sheet:{sh_name}",
+                            requirement_source=f"Starter template '{best_tmpl_name}' population check",
+                            measured=reason,
+                            limit="populated engineering rows/calculations",
+                            tolerance=0,
+                            earliest_suspect_dependency=(
+                                f"Populate template sheet '{sh_name}' with computed values instead of leaving {reason}"
+                            ),
+                            severity="blocker" if is_hard else "warning",
                         )
                     )
 

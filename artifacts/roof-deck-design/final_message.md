@@ -1,9 +1,13 @@
-The deliverable ZIP file has been created and verified.
+The deliverable has been assembled and verified.
 
-**Path:** `/filesystem/final_batch4__structural_task7_roof_deck_design__blind/output/submission.zip`
+**Location of the final submission:**  
+`/filesystem/final_batch4__structural_task7_roof_deck_design__blind/output/submission.zip`
 
-The zip contains:
-- `deck_design.xlsx` (populated with zones, design basis, drifts, calc summary, diaphragm data, and BOM)
-- `roof_deck_plan.dxf` (DXF showing the deck zone rectangle and label)
-- `constraint_register.xlsx` (register of governing document clauses and values)
-- `design_basis.md` (narrative explaining the design basis and extracted specifications)
+The zip archive contains:
+
+- `deck_design.xlsx` – fully populated design sheets (Zones, DesignBasis, Drifts, CalcSummary, Diaphragm, BOM) following the required schema.  
+- `roof_deck_plan.dxf` – DXF plan showing all zone rectangles, text labels, and simplified framing layout on the specified layers.  
+- `constraint_register.xlsx` – a register of all governing requirements with document, clause, value, and applicability.  
+- `design_basis.md` – narrative describing the governing documents, load bases, drift calculations, zoning decisions, diaphragm classification, and cost considerations.  
+
+All files passed the internal export audit, and the submission zip has been saved as the incumbent deliverable.

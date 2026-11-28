@@ -155,14 +155,14 @@ SYSTEM_PROMPT = """You are an expert physical-engineering coordinator working in
 Tools act in {workdir} (and no external internet exists).{mcp_note}
 
 Follow a disciplined 4-step PE engineering workflow:
-1. EXTRACT ALL GOVERNING SPECS FIRST (1-2 batch Python scripts): Read EVERY relevant PDF (`pypdf`/`pdftotext`), DOCX (`python-docx`), XLSX, CSV, JSON, and drawing/spec in the workspace into concise summaries — extract governing design criteria, code clauses, revisions/addenda, unit conventions, and ALL constraint register IDs. NEVER guess or assume a parameter that exists in project documents.
-2. CLONE STARTER TEMPLATES IN-PLACE: Whenever a `*TEMPLATE*.xlsx` or starter `.ifc`/`.json` exists, ALWAYS open and populate a copy of it (`openpyxl.load_workbook(template)`) rather than constructing a fresh `Workbook()` from scratch — preserve every sheet name, column header, and formatting/formula structure. Compute all engineering checks, safety factors, and cost/objective optimizations deterministically in Python.
-3. RECORD EVIDENCE & USE MCP TOOLS: Call `record_evidence` for binding numbers/clauses (`supersedes` on conflicts, `convert_units` for unit consistency), and inspect task MCP tool results before writing dependent files/work packages; call `save_incumbent` whenever a deliverable passes audit.
-4. SELF-VERIFY SAVED DELIVERABLES: Recalculate formulas (`libreoffice --headless` if installed), execute any deliverable generator script (`solution.py`), verify `.ifc`/`.dxf`/`.xlsx`/`.zip` with container parsers (`ifcopenshell`, `ezdxf`, `openpyxl`), and run `run_export_audit` before finishing. NEVER modify read-only input specs/templates, and NEVER output transition chatter ("Let me check...") without a tool call.
+1. EXTRACT ALL GOVERNING SPECS CONCISELY (1-2 batch Python scripts): Read relevant PDFs (`pypdf`/`pdftotext`), DOCX (`python-docx`), XLSX, CSV, JSON, and drawings/specs into compact structured summaries — extract governing design criteria, code clauses, revisions/addenda, unit conventions, and ALL constraint register IDs. Inspect critical drawings/schedules visually with `pdftoppm -png -r 200` + `read_image` when spatial callouts or layout matter. NEVER guess a parameter present in project files.
+2. CLONE STARTER TEMPLATES & OPTIMIZE DESIGNS: Whenever a `*TEMPLATE*.xlsx` or starter `.ifc`/`.json` exists, clone and populate it in-place (`openpyxl.load_workbook`) preserving every sheet name, column, and formula structure. Satisfy every hard constraint (`G=1`) AND optimize the objective (`scipy.optimize`, LP/MIP, sparse FEA, or multi-zone search — never stop at naive uniform defaults or leave calculation/summary tabs at zero).
+3. RECORD EVIDENCE & CHECK MCP: Call `record_evidence` for binding values/conflicts (`supersedes`, `convert_units`), inspect needed task MCP tools concisely (do not loop needlessly before drafting memos/reports), and call `save_incumbent` when a deliverable passes audit.
+4. SELF-VERIFY SAVED DELIVERABLES: Recalculate `.xlsx` formulas (`libreoffice --headless --convert-to xlsx`), re-run deliverable scripts, verify `.ifc` (`RepresentationContexts` + `IfcBuilding` + clash checks), `.dxf`, `.xlsx`, `.pdf`, `.docx`, and `.zip` with container parsers, and call `run_export_audit` before finishing. NEVER modify read-only inputs or emit tool-less filler narration.
 
-CRITICAL SEQUENTIAL RULE: NEVER guess or predict an external MCP output, file read, or calculation result in parallel with writing a file — always call the read/MCP/calculation tool first, wait for the returned observation, and then call `write_file` or `edit_file` on the following turn with the verified result.
+CRITICAL SEQUENTIAL RULE: NEVER predict an MCP output or calculation alongside writing a deliverable — invoke read/MCP/Python first, inspect the result, then write on the next turn.
 
-Time budget: about {minutes} minutes remaining (live updates follow tool results). Only when all requested deliverables and verifications are verified on disk, answer without tool calls summarizing exact paths and checked results."""
+Time budget: about {minutes} minutes remaining (live updates follow tool results). Only when deliverables are verified on disk, reply without tool calls summarizing paths and checked results."""
 
 SUMMARY_PROMPT = (
     "The conversation is getting long, so earlier turns will be removed. Summarize precisely: "
@@ -208,6 +208,9 @@ class RuntimeConfig:
     max_verify_repairs: int
     max_model_calls: int = 0
     enable_workspace_recon: bool = False
+    enable_independent_reviewer: bool = True
+    max_review_rounds: int = 2
+    reviewer_max_calls: int = 12
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -215,13 +218,20 @@ class RuntimeConfig:
         effort = os.environ.get("REASONING_EFFORT") or (
             "max" if any(m in model.lower() for m in MAX_EFFORT_MODELS) else "high"
         )
+        raw_compact = (os.environ.get("COMPACT_AT_TOKENS") or "").strip()
+        if raw_compact:
+            compact_tokens = int(raw_compact)
+        elif any(k in model.lower() for k in ("gemini", "claude", "glm", "llama", "deepseek")):
+            compact_tokens = 220000
+        else:
+            compact_tokens = 90000
         return cls(
             model_name=model,
             reasoning_effort=effort,
             cache_mark="claude" in model.lower(),
             responses_api=model.lower().startswith(RESPONSES_MODELS),
             max_output_tokens=int(os.environ.get("MAX_OUTPUT_TOKENS", "32000")),
-            compact_at_tokens=int(os.environ.get("COMPACT_AT_TOKENS", "140000")),
+            compact_at_tokens=compact_tokens,
             reserve_verify_sec=int(os.environ.get("RESERVE_VERIFY_SEC", "150")),
             budget_cap_usd=float(os.environ.get("BUDGET_CAP_USD", "0") or "0"),
             mcp_discovery_mode=os.environ.get("MCP_DISCOVERY_MODE", "ondemand").strip().lower(),
@@ -234,6 +244,9 @@ class RuntimeConfig:
             max_verify_repairs=max(0, int(os.environ.get("MAX_VERIFY_REPAIRS", "2"))),
             max_model_calls=max(0, int(os.environ.get("MAX_MODEL_CALLS", "0") or "0")),
             enable_workspace_recon=_env_bool("ENABLE_WORKSPACE_RECON", False),
+            enable_independent_reviewer=_env_bool("ENABLE_INDEPENDENT_REVIEWER", True),
+            max_review_rounds=max(0, int(os.environ.get("MAX_REVIEW_ROUNDS", "2") or "2")),
+            reviewer_max_calls=max(2, int(os.environ.get("REVIEWER_MAX_CALLS", "12") or "12")),
         )
 
 
@@ -359,7 +372,7 @@ def create_client() -> openai.AsyncOpenAI:
         base_url=os.environ.get("MODEL_BASE_URL"),
         api_key=os.environ.get("MODEL_API_KEY") or "none",
         max_retries=0,
-        timeout=900,
+        timeout=1800,
     )
 
 
@@ -422,6 +435,8 @@ def merged(old: Any, new: Any, key: str = "") -> Any:
         return {**old, **{k: merged(old.get(k), v, k) for k, v in new.items()}}
     if isinstance(old, list) and isinstance(new, list):
         return old + new
+    if isinstance(new, str) and not new and isinstance(old, str) and old:
+        return old
     return new
 
 
@@ -670,6 +685,11 @@ class EngineeringCoordinator:
         self.incumbent_total_bytes = 0
         self._write_seq = 0
         self._wrote_after_mcp = False
+        self._mcp_nudge_fired = False
+        self._post_mcp_write_nudge_fired = False
+        self._has_libreoffice = False
+        self._image_input_disabled = False
+        self._workspace_brief = ""
         self._pending_images: list[tuple[str, str]] = []
         self._last_durable_summary = ""
         self._total_time_sec: float | None = None
@@ -908,6 +928,7 @@ __PLE_RECON__"""
                 lines.append(f"  - {js.get('path')} ({js.get('kind')}): keys={js.get('keys')}")
 
         pkgs = data.get("packages") or {}
+        self._has_libreoffice = bool(pkgs.get("libreoffice"))
         avail = [k for k, v in pkgs.items() if v]
         missing = [k for k, v in pkgs.items() if not v]
         if avail or missing:
@@ -923,6 +944,7 @@ __PLE_RECON__"""
         mcp_note = await self.catalog.connect(self.session)
         self.tools = build_base_tools(self.config) + self.catalog.exposed_tools()
         workspace_brief = await self._workspace_recon()
+        self._workspace_brief = workspace_brief
         left = self.session.time_left()
         self._total_time_sec = left
         self.finish_margin = (
@@ -941,7 +963,7 @@ __PLE_RECON__"""
             },
             {"role": "user", "content": (self.session.instruction or "") + workspace_brief},
         ]
-        nudges, head, repairs, progress_nudges, len_continues = 0, "", 0, 0, 0
+        nudges, head, repairs, progress_nudges, len_continues, review_rounds = 0, "", 0, 0, 0, 0
         try:
             while True:
                 left = self.session.time_left()
@@ -1026,6 +1048,21 @@ __PLE_RECON__"""
                                 nudges, head, len_continues = 0, "", 0
                                 self.messages.append({"role": "user", "content": gate_feedback})
                                 continue
+                        rev_left = self.session.time_left()
+                        if (
+                            self.config.enable_independent_reviewer
+                            and self.touched_deliverables
+                            and review_rounds < self.config.max_review_rounds
+                            and not self.usage_tracker.budget_exhausted()
+                            and (self.config.max_model_calls == 0 or (self.config.max_model_calls - self.usage_tracker.calls) >= 8)
+                            and (rev_left is None or rev_left > max(self.finish_margin * 2.5, 420.0))
+                        ):
+                            review_feedback = await self._run_independent_review(text)
+                            if review_feedback:
+                                review_rounds += 1
+                                nudges, head, len_continues = 0, "", 0
+                                self.messages.append({"role": "user", "content": review_feedback})
+                                continue
                         return text or self._last_durable_summary or self.session.final_message
                     max_empty_nudges = MAX_PROGRESS_NUDGES if not self.touched_deliverables else 3
                     if nudges >= max_empty_nudges:
@@ -1043,29 +1080,21 @@ __PLE_RECON__"""
                 nudges, head, len_continues = 0, "", 0
                 calls_list = list(reply.calls.values())
                 has_mcp_call = any(self.catalog.is_mcp_tool(c["name"]) for c in calls_list)
-                unqueried_mcp = bool(self.catalog.registry) and self.catalog.successful_calls == 0
                 deferred_msg = (
                     "deferred: inspect the MCP result returned in this turn before calling "
                     "write_file/edit_file so you write verified data"
                 )
-                pre_mcp_msg = (
-                    "deferred: connected MCP tool(s) have not been called yet; invoke the needed MCP "
-                    "tool first and wait for its returned result before writing deliverables"
-                )
                 results: list[str | None] = [None] * len(calls_list)
-                # Execute MCP tool calls before any other calls; defer premature writes/edits in the same batch
-                # or deliverable writes attempted before any connected MCP tool has succeeded.
+                # Execute MCP tool calls before any other calls; only defer same-turn writes/edits
+                # issued in parallel with an MCP call until its output returns.
                 for idx, (call, args) in enumerate(zip(calls_list, arguments)):
-                    if call["name"] in ("write_file", "edit_file"):
-                        target_path = str(args.get("path") or "").lower() if isinstance(args, dict) else ""
-                        is_script = target_path.endswith((".py", ".sh"))
-                        if isinstance(args, dict) and (has_mcp_call or (unqueried_mcp and not is_script)):
+                    if call["name"] in ("write_file", "edit_file") and has_mcp_call:
+                        if isinstance(args, dict):
                             await self.session.log(f"deferred {call['name']} pending MCP observation")
-                            results[idx] = deferred_msg if has_mcp_call else pre_mcp_msg
-                            continue
-                        if not isinstance(args, dict) and has_mcp_call:
+                            results[idx] = deferred_msg
+                        else:
                             results[idx] = args
-                            continue
+                        continue
                     if self.catalog.is_mcp_tool(call["name"]):
                         results[idx] = (
                             await self.run_tool(call["name"], args)
@@ -1127,8 +1156,13 @@ __PLE_RECON__"""
     async def _pre_completion_gate(self, narrative_text: str) -> str | None:
         """Runs deterministic cold-read checks before accepting final completion."""
         issues: list[str] = []
-        used_any_tool = any(m.get("role") == "tool" for m in self.messages)
-        if self.catalog.registry and self.catalog.successful_calls == 0:
+        left = self.session.time_left()
+        has_mcp_budget = (
+            self.config.max_model_calls == 0
+            or (self.config.max_model_calls - self.usage_tracker.calls) >= 6
+        ) and (left is None or left > 300)
+        if self.catalog.registry and self.catalog.successful_calls == 0 and not self._mcp_nudge_fired and has_mcp_budget:
+            self._mcp_nudge_fired = True
             groups = sorted(self.catalog.service_groups().keys())
             hint = (
                 ", ".join(groups[:10])
@@ -1137,15 +1171,20 @@ __PLE_RECON__"""
             )
             issues.append(
                 f"Connected MCP services ({hint}) have not been queried yet (0 successful MCP calls). "
-                "Use mcp_search_tools + mcp_call_tool (or direct MCP tools) to check case tracking, email, wiki, or portal records before finishing."
+                "Use mcp_search_tools + mcp_call_tool (or direct MCP tools) once to check case tracking, email, wiki, or portal records before finishing."
             )
-        elif self.catalog.registry and self.catalog.successful_calls > 0 and not self._wrote_after_mcp and (
-            m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or "")
+        elif (
+            self.catalog.registry
+            and self.catalog.successful_calls > 0
+            and not self._wrote_after_mcp
+            and not self._post_mcp_write_nudge_fired
+            and (m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or ""))
         ):
+            self._post_mcp_write_nudge_fired = True
             requested = ", ".join(sorted(set(m_deliv))[:4])
             issues.append(
                 f"No deliverable ({requested}) was written or updated after observing the MCP tool output. "
-                "Call write_file/edit_file with the exact observed MCP result before finishing."
+                "Call write_file/edit_file or bash with the exact observed MCP result before finishing."
             )
         if not self.touched_deliverables:
             if m_deliv := DELIVERABLE_MENTION_RE.findall(self.session.instruction or ""):
@@ -1220,11 +1259,142 @@ __PLE_RECON__"""
             text = ""
         return text or self._last_durable_summary or self.session.final_message
 
+    async def _run_independent_review(self, worker_summary: str) -> str | None:
+        """Runs a fresh-context read-only PE audit before final acceptance."""
+        rev_tool_names = (
+            ("bash", "read_file", "read_image")
+            if (self.config.enable_image_input and not self._image_input_disabled)
+            else ("bash", "read_file")
+        )
+        rev_tools = [t for t in build_base_tools(self.config) if t["function"]["name"] in rev_tool_names]
+        deliverable_list = ", ".join(sorted(self.touched_deliverables)[:12]) or "(check workdir)"
+        rev_system = (
+            f"You are a licensed Senior Principal Engineer auditing deliverables in {self.session.workdir} "
+            "before final stamp. You operate READ-ONLY: NEVER create, edit, or delete deliverable files.\n"
+            "Verify with 1-2 concise Python scripts via `bash` or `read_file`: "
+            "(1) exact deliverable paths, non-empty formats, template sheets/columns, zero Excel error tokens "
+            "(#REF!, #DIV/0!, #VALUE!, #NAME?), and populated calculation/summary tabs (not all zeros/blank); "
+            "(2) hard constraints (G=1: safety factors, clearances, 3D clashes, IFC4 RepresentationContexts and "
+            "spatial hierarchy, governing code clauses, unit consistency); "
+            "(3) objective optimization (multi-zone/LP/FEA optimization rather than naive uniform defaults); "
+            "(4) full coverage of all memo/rubric questions and numerical citations.\n"
+            "Reply with the single word PASS if everything holds, or a numbered list of concrete, fixable defects "
+            "citing exact file paths, sheets/cells, and computed gaps."
+        )
+        rev_user = (
+            f"Task prompt:\n{(self.session.instruction or '')[:12000]}"
+            f"{self._workspace_brief[:3500]}\n\n"
+            f"Deliverables touched: {deliverable_list}\n\n"
+            f"Worker summary:\n{worker_summary[:4000]}\n\n"
+            "Independently audit the deliverables on disk and reply PASS or a numbered defect list."
+        )
+        rev_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": rev_system},
+            {"role": "user", "content": rev_user},
+        ]
+        rev_pending_images: list[tuple[str, str]] = []
+        await self.session.log("starting independent fresh-context PE review")
+        try:
+            for _ in range(self.config.reviewer_max_calls):
+                if self.usage_tracker.budget_exhausted():
+                    return None
+                if self.config.max_model_calls > 0 and self.usage_tracker.calls >= self.config.max_model_calls - 2:
+                    return None
+                cur_left = self.session.time_left()
+                if cur_left is not None and cur_left < self.finish_margin + 90.0:
+                    return None
+                reply = await self._complete_messages(
+                    rev_messages,
+                    tool_choice="auto",
+                    tools_override=rev_tools if not self._image_input_disabled else [
+                        t for t in rev_tools if t["function"]["name"] != "read_image"
+                    ],
+                )
+                rev_messages.append(reply.message())
+                if not reply.calls:
+                    rev_text = visible(reply.text)
+                    if not rev_text or re.match(r"^\s*(?:VERDICT\s*:\s*)?PASS\b", rev_text, re.I):
+                        await self.session.log("independent PE review: PASS")
+                        return None
+                    await self.session.log(f"independent PE review flagged gaps ({len(rev_text)} chars)")
+                    return (
+                        "Independent PE Review found concrete defects to fix "
+                        "(prior passing files can be restored with restore_incumbent):\n"
+                        + rev_text
+                    )
+                for call in reply.calls.values():
+                    args = parse_arguments(call)
+                    cname = call["name"]
+                    if not isinstance(args, dict):
+                        out_txt = args
+                    elif cname == "bash" and hasattr(self.session, "exec"):
+                        try:
+                            cap = int(self.session.limits.get("exec_timeout_sec") or 120)
+                            res = await self.session.exec(
+                                args["command"],
+                                taskbridge.positive_int(args.get("timeout_sec"), 60, min(cap, 60)),
+                            )
+                            note = " (timed out)" if res.get("timed_out") else ""
+                            out_txt = clip(f"exit code {res['exit_code']}{note}\n{res.get('output') or '(no output)'}")
+                        except Exception as exc:
+                            out_txt = f"error: {type(exc).__name__}: {exc}"
+                    elif cname == "read_file":
+                        try:
+                            resolved = self._resolve(args["path"])
+                            data = await self.session.read_file(resolved)
+                            out_txt = (
+                                f"{args['path']} is binary ({len(data)} bytes)"
+                                if b"\0" in data[:8192]
+                                else clip(data.decode("utf-8", "replace") or "(empty file)")
+                            )
+                        except Exception as exc:
+                            out_txt = f"error: {type(exc).__name__}: {exc}"
+                    elif cname == "read_image":
+                        try:
+                            resolved = self._resolve(args["path"])
+                            data = await self.session.read_file(resolved)
+                            if len(data) > 5 * 1024 * 1024:
+                                out_txt = f"error: image {args['path']} exceeds 5 MiB limit"
+                            else:
+                                lower = resolved.lower()
+                                mime = "image/jpeg" if lower.endswith((".jpg", ".jpeg")) else "image/png"
+                                b64 = base64.b64encode(data).decode("ascii")
+                                rev_pending_images.append((args["path"], f"data:{mime};base64,{b64}"))
+                                out_txt = f"queued image {args['path']} ({len(data)} bytes) for visual inspection"
+                        except Exception as exc:
+                            out_txt = f"error: {type(exc).__name__}: {exc}"
+                    else:
+                        out_txt = f"error: reviewer is read-only; tool {cname} not permitted"
+                    rev_messages.append({"role": "tool", "tool_call_id": call["id"], "content": out_txt})
+                if rev_pending_images:
+                    parts: list[dict[str, Any]] = [
+                        {"type": "text", "text": f"Loaded image crop: {p}"} for p, _ in rev_pending_images
+                    ]
+                    for _, url in rev_pending_images:
+                        parts.append({"type": "image_url", "image_url": {"url": url}})
+                    rev_messages.append({"role": "user", "content": parts})
+                    rev_pending_images.clear()
+        except (CutOff, OutOfTime, BudgetExhausted, openai.OpenAIError, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            await self.session.log(f"independent PE review aborted cleanly: {type(exc).__name__}: {exc}")
+        return None
+
     async def complete(
         self,
         tool_choice: str = "auto",
         reserve: float | None = None,
         head: str | None = None,
+    ) -> Reply:
+        return await self._complete_messages(self.messages, tool_choice=tool_choice, reserve=reserve, head=head)
+
+    async def _complete_messages(
+        self,
+        messages: list[dict[str, Any]],
+        tool_choice: str = "auto",
+        reserve: float | None = None,
+        head: str | None = None,
+        tools_override: list[dict[str, Any]] | None = None,
     ) -> Reply:
         if self.usage_tracker.budget_exhausted():
             raise BudgetExhausted("Configured budget cap reached")
@@ -1233,19 +1403,19 @@ __PLE_RECON__"""
         waits = iter(w * retry_scale for w in RETRY_WAITS)
         while True:
             try:
-                reply = await self.stream(self.messages, tool_choice, reserve_sec, head)
+                reply = await self.stream(messages, tool_choice, reserve_sec, head, tools_override=tools_override)
                 if reply.finish is None:
                     raise StreamCut("stream ended without a finish reason")
-                await self.record(reply)
+                await self.record(reply, messages=messages)
                 return reply
             except openai.APIStatusError as exc:
-                if exc.status_code == 400 and await self.remedy(str(exc)):
+                if exc.status_code == 400 and await self.remedy(str(exc), messages=messages):
                     continue
                 if not (exc.status_code in (408, 409, 429) or exc.status_code >= 500):
                     raise
                 failure: Exception = exc
             except StreamBadRequest as exc:
-                if await self.remedy(str(exc)):
+                if await self.remedy(str(exc), messages=messages):
                     continue
                 raise
             except (openai.APIError, StreamCut) as exc:
@@ -1260,23 +1430,54 @@ __PLE_RECON__"""
             await self.session.log(f"model call failed ({str(failure)[:300]}); retry in {wait}s")
             await asyncio.sleep(wait)
 
-    async def remedy(self, error: str) -> bool:
+    async def remedy(self, error: str, messages: list[dict[str, Any]] | None = None) -> bool:
+        target_msgs = messages if messages is not None else self.messages
         if CONTEXT_FULL.search(error):
             sent, measured = self.max_output, self.learn_context(error)
             if measured and (self.room() or 0) >= MIN_OUTPUT and self.output_limit() < sent:
                 return True
-            return bool(
-                await self.compact(force=True)
-                or (not measured and self.output_limit() < sent)
-                or self.cut_unread()
-            )
+            if target_msgs is self.messages:
+                return bool(
+                    await self.compact(force=True)
+                    or (not measured and self.output_limit() < sent)
+                    or self.cut_unread()
+                )
+            return bool(self.cut_unread(target_msgs))
         return (
-            self.use_responses(error)
+            self.drop_image_input(error, target_msgs)
+            or self.use_responses(error)
             or self.use_max_tokens(error)
             or self.drop_stream_options(error)
             or self.drop_effort(error)
             or self.shrink_output(error)
         )
+
+    def drop_image_input(self, error: str, messages: list[dict[str, Any]] | None = None) -> bool:
+        if self._image_input_disabled or not re.search(
+            r"image_url|image input|vision|multimodal|does not support image|unsupported content",
+            error,
+            re.I,
+        ):
+            return False
+        self._image_input_disabled = True
+        self.tools = [t for t in self.tools if t["function"]["name"] != "read_image"]
+        for msg_list in (self.messages, messages):
+            if not msg_list:
+                continue
+            for m in msg_list:
+                content = m.get("content")
+                if isinstance(content, list) and any(
+                    isinstance(p, dict) and p.get("type") == "image_url" for p in content
+                ):
+                    text_parts = [
+                        str(p.get("text") or "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
+                    ]
+                    m["content"] = ("\n".join(text_parts) + "\n" if text_parts else "") + (
+                        "[Image omitted: active model does not accept image_url inputs; use pdftotext/pypdf text extraction.]"
+                    )
+        return True
 
     def use_responses(self, error: str) -> bool:
         if self.responses or not RESPONSES_ONLY.search(error):
@@ -1357,10 +1558,11 @@ __PLE_RECON__"""
             min(self.config.compact_at_tokens, self.context_window - room - CONTEXT_MARGIN),
         )
 
-    def estimate_prompt_tokens(self) -> int:
+    def estimate_prompt_tokens(self, messages: list[dict[str, Any]] | None = None) -> int:
+        active_msgs = messages if messages is not None else self.messages
         return sum(
             len(json.dumps({k: v for k, v in m.items() if k != "output_items"}))
-            for m in self.messages
+            for m in active_msgs
         ) // 4
 
     async def stream(
@@ -1369,19 +1571,21 @@ __PLE_RECON__"""
         tool_choice: str,
         reserve: float,
         head: str | None = None,
+        tools_override: list[dict[str, Any]] | None = None,
     ) -> Reply:
         left = self.session.time_left()
         self.max_output = self.output_limit()
+        active_tools = tools_override if tools_override is not None else self.tools
         reply = Reply()
 
         async def read() -> None:
             if self.responses:
-                await self.respond(reply, messages, tool_choice)
+                await self.respond(reply, messages, tool_choice, tools_override=active_tools)
                 return
             stream = await self.client.chat.completions.create(
                 model=self.config.model_name,
                 messages=marked(messages, self.config.cache_mark),
-                tools=self.tools,
+                tools=active_tools,
                 tool_choice=tool_choice,
                 stream=True,
                 **self.stream_options,
@@ -1423,16 +1627,23 @@ __PLE_RECON__"""
             raise StreamBadRequest(said["message"]) from exc
 
         for n, call in reply.calls.items():
-            call["id"] = call["id"] or f"call_{n}_{len(self.messages)}"
+            call["id"] = call["id"] or f"call_{n}_{len(messages)}"
             call["name"] = call["name"].split("<|")[0].strip()
         return reply
 
-    async def respond(self, reply: Reply, messages: list[dict[str, Any]], tool_choice: str) -> None:
+    async def respond(
+        self,
+        reply: Reply,
+        messages: list[dict[str, Any]],
+        tool_choice: str,
+        tools_override: list[dict[str, Any]] | None = None,
+    ) -> None:
         effort = self.effort.get("reasoning_effort")
+        active_tools = tools_override if tools_override is not None else self.tools
         stream = await self.client.responses.create(
             model=self.config.model_name,
             input=response_input(messages),
-            tools=[{"type": "function", **t["function"], "strict": False} for t in self.tools],
+            tools=[{"type": "function", **t["function"], "strict": False} for t in active_tools],
             tool_choice=tool_choice,
             stream=True,
             store=False,
@@ -1473,17 +1684,20 @@ __PLE_RECON__"""
                 else:
                     reply.finish = reason if reason == "content_filter" else "length"
 
-    async def record(self, reply: Reply) -> None:
+    async def record(self, reply: Reply, messages: list[dict[str, Any]] | None = None) -> None:
         schema_toks = estimate_schema_tokens(self.tools)
+        is_main = messages is None or messages is self.messages
         if reply.usage is None:
-            est = self.estimate_prompt_tokens()
-            self.prompt_tokens = est
+            est = self.estimate_prompt_tokens(messages)
+            if is_main:
+                self.prompt_tokens = est
             self.usage_tracker.record(est, len(reply.text) // 4, 0, reconstructed=True, schema_tokens=schema_toks)
             return
         in_tok = int(reply.usage.prompt_tokens or 0)
         out_tok = int(reply.usage.completion_tokens or 0)
         cached = int(getattr(getattr(reply.usage, "prompt_tokens_details", None), "cached_tokens", 0) or 0)
-        self.prompt_tokens = in_tok
+        if is_main:
+            self.prompt_tokens = in_tok
         self.usage_tracker.record(in_tok, out_tok, cached, reconstructed=False, schema_tokens=schema_toks)
         await self.session.usage(self.config.model_name, in_tok, out_tok, cached)
 
@@ -1717,6 +1931,7 @@ __PLE_RECON__"""
                 )
                 return {"ok": ok_py, "path": resolved, "defects": defects_py}
             if kind == "workbook":
+                raw = await self._recalc_workbook_if_needed(resolved, raw)
                 res = audit_workbook_bytes(
                     raw,
                     required_items=required_items,
@@ -1862,9 +2077,60 @@ __PLE_RECON__"""
         self._note_written_path(resolved)
         return f"restored {path} ({size} bytes) from incumbent ({note or 'verified'})"
 
-    def unread(self) -> list[dict[str, Any]]:
-        last = max((n for n, m in enumerate(self.messages) if m["role"] == "assistant"), default=0)
-        return [m for m in self.messages[last:] if m["role"] == "tool"]
+    async def _recalc_workbook_if_needed(self, resolved: str, raw: bytes) -> bytes:
+        """Runs LibreOffice headless recalculation if an exported .xlsx has uncached formulas."""
+        if not self._has_libreoffice or not hasattr(self.session, "exec") or not resolved.lower().endswith(".xlsx"):
+            return raw
+        try:
+            import openpyxl as _oxl
+
+            wb_f = _oxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=False)
+            wb_v = _oxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            orig_sheets = list(wb_f.sheetnames)
+            needs_recalc = False
+            for sname in orig_sheets:
+                ws_f = wb_f[sname]
+                ws_v = wb_v[sname]
+                for row_f, row_v in zip(ws_f.iter_rows(values_only=True), ws_v.iter_rows(values_only=True)):
+                    for fv, vv in zip(row_f, row_v):
+                        if isinstance(fv, str) and fv.startswith("=") and vv is None:
+                            needs_recalc = True
+                            break
+                    if needs_recalc:
+                        break
+                if needs_recalc:
+                    break
+            wb_f.close()
+            wb_v.close()
+            if not needs_recalc:
+                return raw
+
+            stem = posixpath.splitext(posixpath.basename(resolved))[0]
+            outdir = "/tmp/_ple_recalc"
+            out_file = posixpath.join(outdir, f"{stem}.xlsx")
+            q_src = shlex.quote(resolved)
+            q_out = shlex.quote(out_file)
+            cmd = (
+                f"mkdir -p {outdir} && rm -f {q_out} && "
+                f"libreoffice --headless --convert-to xlsx --outdir {outdir} {q_src} >/dev/null 2>&1 && "
+                f"python3 -c \"import openpyxl,sys; wb=openpyxl.load_workbook(sys.argv[1],read_only=True); "
+                f"assert list(wb.sheetnames)=={orig_sheets!r}; wb.close()\" {q_out} && "
+                f"cp {q_out} {q_src}"
+            )
+            rec = await self.session.exec(cmd, 30)
+            if rec.get("exit_code") == 0:
+                new_raw = await self.session.read_file(resolved)
+                if new_raw:
+                    await self.session.log(f"libreoffice recalculated uncached formulas in {resolved}")
+                    return new_raw
+        except Exception:
+            pass
+        return raw
+
+    def unread(self, messages: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        active = messages if messages is not None else self.messages
+        last = max((n for n, m in enumerate(active) if m["role"] == "assistant"), default=0)
+        return [m for m in active[last:] if m["role"] == "tool"]
 
     async def compact(self, force: bool = False) -> bool:
         unread_ids = {id(m) for m in self.unread()}
@@ -1908,20 +2174,22 @@ __PLE_RECON__"""
         self.prompt_tokens = self.estimate_prompt_tokens()
         return True
 
-    def cut_unread(self) -> bool:
+    def cut_unread(self, messages: list[dict[str, Any]] | None = None) -> bool:
+        active = messages if messages is not None else self.messages
         unread = [
-            m for m in self.unread()
+            m for m in self.unread(active)
             if isinstance(m.get("content"), str) and len(m["content"]) > 2 * UNREAD_KEEP
         ]
         if not unread:
             return False
         share = None
         if self.context_window:
-            rest = self.estimate_prompt_tokens() - sum(len(m["content"]) for m in unread) // 4
+            rest = self.estimate_prompt_tokens(active) - sum(len(m["content"]) for m in unread) // 4
             share = (self.compact_at() - rest) * 4 // len(unread)
         for m in unread:
             size = len(m["content"])
             keep = size // 2 if share is None or share >= size - 100 else share
             m["content"] = clip(m["content"], max(UNREAD_KEEP, keep))
-        self.prompt_tokens = self.estimate_prompt_tokens()
+        if active is self.messages:
+            self.prompt_tokens = self.estimate_prompt_tokens()
         return True

@@ -149,3 +149,32 @@ def test_ifc4_injected_clashes_self_clash_unserved_and_forbidden_zone() -> None:
     assert not res_zone.ok
     assert len(res_zone.forbidden_zone_violations) == 1
     assert res_zone.forbidden_zone_violations[0]["zone"] == "MainAisle"
+
+
+def test_ifc4_representation_contexts_and_spatial_structure_gates() -> None:
+    """Tests that IfcProject exports missing RepresentationContexts or spatial containers fail deterministically."""
+    base_lines = _build_synthetic_ifc4().decode("utf-8").splitlines()
+    end_idx = len(base_lines) - 1 - base_lines[::-1].index("ENDSEC;")
+
+    bad_lines = (
+        base_lines[:end_idx]
+        + ["#90=IFCPROJECT('p1',$,'MEP',$,$,$,$,$,$);"]
+        + base_lines[end_idx:]
+    )
+    res_bad = audit_ifc4_bytes("\n".join(bad_lines).encode("utf-8"))
+    assert not res_bad.ok
+    defect_items = {d["item"] for d in res_bad.defects}
+    assert "missing_representation_contexts" in defect_items
+    assert "missing_spatial_structure" in defect_items
+
+    good_lines = (
+        base_lines[:end_idx]
+        + [
+            "#91=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#4,$);",
+            "#90=IFCPROJECT('p1',$,'MEP',$,$,$,$,(#91),$);",
+            "#92=IFCBUILDING('b1',$,'DataHall',$,$,#5,$,$,.ELEMENT.,$,$,$);",
+        ]
+        + base_lines[end_idx:]
+    )
+    res_good = audit_ifc4_bytes("\n".join(good_lines).encode("utf-8"))
+    assert res_good.ok, res_good.defects

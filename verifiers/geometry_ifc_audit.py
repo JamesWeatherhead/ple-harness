@@ -770,6 +770,43 @@ def audit_ifc4_bytes(
             }
         )
 
+    project_entities = [args for _, (et, args) in entities.items() if et == "IFCPROJECT"]
+    if project_entities:
+        has_geom_ctx = any(
+            et in ("IFCGEOMETRICREPRESENTATIONCONTEXT", "IFCGEOMETRICREPRESENTATIONSUBCONTEXT")
+            for _, (et, _) in entities.items()
+        )
+        proj_has_ctx = any(
+            len(args) > 7 and bool(_parse_ref_list(args[7]))
+            for args in project_entities
+        )
+        if not has_geom_ctx or not proj_has_ctx:
+            defects.append(
+                {
+                    "item": "missing_representation_contexts",
+                    "requirement_source": "IFC4 schema: IfcProject.RepresentationContexts required for geometry validation",
+                    "measured": "missing" if not has_geom_ctx else "unlinked on IfcProject",
+                    "limit": "non-empty IfcProject.RepresentationContexts referencing IfcGeometricRepresentationContext",
+                    "tolerance": 0,
+                    "earliest_suspect_dependency": "Create an IfcGeometricRepresentationContext ('Model', 3D) and attach it to IfcProject.RepresentationContexts (e.g., via ifcopenshell.api.context.add_context)",
+                }
+            )
+        has_spatial = any(
+            et in ("IFCSITE", "IFCBUILDING", "IFCBUILDINGSTOREY")
+            for _, (et, _) in entities.items()
+        )
+        if not has_spatial:
+            defects.append(
+                {
+                    "item": "missing_spatial_structure",
+                    "requirement_source": "IFC4 spatial hierarchy: IfcSite/IfcBuilding/IfcBuildingStorey required",
+                    "measured": "none",
+                    "limit": ">= 1 spatial container",
+                    "tolerance": 0,
+                    "earliest_suspect_dependency": "Create IfcSite / IfcBuilding / IfcBuildingStorey and assign elements via ifcopenshell.api.spatial.assign_container",
+                }
+            )
+
     return IFC4AuditResult(
         ok=len(defects) == 0,
         elements=elements,

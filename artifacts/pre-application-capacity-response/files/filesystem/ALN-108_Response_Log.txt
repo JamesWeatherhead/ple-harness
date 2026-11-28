@@ -1,4 +1,0 @@
-Evidence record (Case_ALN-108_PreApp_Request): {"recorded": {"ok": true, "key": "Case_ALN-108_PreApp_Request", "normalized_value": null, "normalized_unit": "MW", "entries_for_key": 1, "unresolved_conflict": false, "conflicts": []}, "unresolved_conflicts": []}
-Evidence record (FollowUp_ALN-108_PreApp): {"recorded": {"ok": true, "key": "FollowUp_ALN-108_PreApp", "normalized_value": null, "normalized_unit": "", "entries_for_key": 1, "unresolved_conflict": false, "conflicts": []}, "unresolved_conflicts": []}
-Mail send result: Mail sent successfully! Mail ID: <179577352913.1344.5949795402938401919@alleniom.com>, Recipients: 1
-OpenProject comment activity: {"success":true,"activity_id":56,"error":""}
