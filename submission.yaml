@@ -20,7 +20,7 @@ install: >-
 serve: /opt/harness/venv/bin/python {src}/serve.py
 env:
   COMPACT_AT_TOKENS: "220000"
-  MAX_OUTPUT_TOKENS: "16384"
+  MAX_OUTPUT_TOKENS: "32000"
   MAX_MODEL_CALLS: "0"
   REASONING_EFFORT: "high"
   RESERVE_VERIFY_SEC: "300"

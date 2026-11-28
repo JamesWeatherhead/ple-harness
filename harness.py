@@ -1411,6 +1411,9 @@ __PLE_RECON__"""
             except openai.APIStatusError as exc:
                 if exc.status_code == 400 and await self.remedy(str(exc), messages=messages):
                     continue
+                if exc.status_code == 402 and self.shrink_output(str(exc)):
+                    await self.session.log(f"402 budget pre-hold: shrunk output_ceiling to {self.output_ceiling}")
+                    continue
                 if not (exc.status_code in (408, 409, 429) or exc.status_code >= 500):
                     raise
                 failure: Exception = exc
@@ -1521,11 +1524,18 @@ __PLE_RECON__"""
             error,
             re.I,
         )
+        afford = re.search(r"can only afford (\d+)", error, re.I)
         if limit:
             new = int(limit.group(1)) - 1
         elif stated:
             new = int(next(g for g in stated.groups() if g))
-        elif re.search(r"max_?(completion_)?tokens|maxOutputTokens|output tokens", error, re.I):
+        elif afford:
+            new = min(max(MIN_OUTPUT, int(afford.group(1)) - 512), self.max_output // 2)
+        elif re.search(
+            r"max_?(completion_)?tokens|maxOutputTokens|output tokens|weight_exceeds_budget|fewer max_tokens|lower max_tokens",
+            error,
+            re.I,
+        ):
             new = self.max_output // 2
         else:
             return False

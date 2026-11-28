@@ -1457,3 +1457,62 @@ def test_v3_image_input_auto_fallback_on_400(monkeypatch: Any) -> None:
         assert coord._image_input_disabled is True
         assert all(t["function"]["name"] != "read_image" for t in coord.tools)
 
+
+def test_v3_credit_402_shrink_output_fallback(monkeypatch: Any) -> None:
+    """Tests HTTP 402 credit pre-hold errors trigger shrink_output down to affordable max_tokens."""
+    sys.path.insert(0, str(ROOT))
+    import harness
+    import openai
+
+    seen_limits: list[int | None] = []
+
+    class _MinimalSession:
+        workdir = "/workspace"
+        instruction = "Say ok and finish."
+        mcp_servers: list[dict] = []
+        limits = {"exec_timeout_sec": 60}
+        final_message = ""
+
+        def time_left(self) -> float:
+            return 200.0
+
+        async def log(self, text: str) -> None:
+            return None
+
+        async def usage(self, model: str, i: int, o: int, c: int) -> None:
+            return None
+
+    def handle(h: BaseHTTPRequestHandler, idx: int, body: dict) -> None:
+        seen_limits.append(body.get("max_completion_tokens") or body.get("max_tokens"))
+        if idx == 0:
+            _MockOpenAIServer.send_json(
+                h,
+                402,
+                {"error": {"message": "This request requires more credits, or fewer max_tokens. You requested up to 32000 tokens, but can only afford 24508."}},
+            )
+        elif idx == 1:
+            _MockOpenAIServer.send_json(
+                h,
+                402,
+                {"error": {"message": "This request's maximum cost exceeds your available credits. Add credits, or lower max_tokens or prompt size.", "metadata": {"reason": "weight_exceeds_budget"}}},
+            )
+        else:
+            _MockOpenAIServer.send_sse(h, [
+                _sse_chunk({"role": "assistant", "content": "Completed after 402 max_tokens fallback."}),
+                _sse_chunk({}, finish_reason="stop", usage={"prompt_tokens": 30, "completion_tokens": 8}),
+            ])
+
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_NAME", "google-cloud/gemini-4-neon")
+    monkeypatch.setenv("MAX_OUTPUT_TOKENS", "32000")
+    monkeypatch.setenv("ENABLE_WORKSPACE_RECON", "false")
+    monkeypatch.setenv("ENABLE_INDEPENDENT_REVIEWER", "false")
+    with _MockOpenAIServer(handle) as oai:
+        cfg = harness.RuntimeConfig.from_env()
+        client = openai.AsyncOpenAI(base_url=oai.url, api_key="test-key")
+        coord = harness.EngineeringCoordinator(_MinimalSession(), config=cfg, client=client)
+        out = asyncio.run(coord.run())
+        assert "Completed after 402 max_tokens fallback." in out
+        assert seen_limits == [32000, 16000, 8000]
+
+

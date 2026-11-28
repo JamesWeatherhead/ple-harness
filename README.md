@@ -3,14 +3,14 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-1e4d79.svg)](LICENSE)
 [![Stage-2 Target](https://img.shields.io/badge/Stage--2%20Target-google--cloud%2Fgemini--4--neon-1b9e70.svg)](submission.yaml)
 [![Protocol](https://img.shields.io/badge/Protocol-taskbridge%20v1-a3246e.svg)](taskbridge.py)
-[![Tests](https://img.shields.io/badge/pytest-40%20passed%20%7C%200%20failed-1b9e70.svg)](#verified-checks--reproducibility)
+[![Tests](https://img.shields.io/badge/pytest-41%20passed%20%7C%200%20failed-1b9e70.svg)](#verified-checks--reproducibility)
 [![Dev Artifacts](https://img.shields.io/badge/Dev%20Artifacts-29%2F29%20usable-1b9e70.svg)](artifacts/manifest.json)
 
 **Deterministic gate-survival agent harness for Google's [Physical-Engineering's Last Exam (PLE)](https://ple-bench.com/).**
 
 Most agent harnesses treat engineering failures as model reasoning deficits—assuming that shell access, eager tool schemas, and aggressive `50k` compaction suffice. Across 29 public dev tasks under locked Stage-2 `google-cloud/gpt-oss-120b` pricing (`$0.09/$0.36` per 1M tokens; `deepseek/deepseek-v4.1-flash` local judge), paired runs contradict that assumption: a capped starter baseline (`0.065`, `$0.033/task`, `1.09 min/task`) drops `2/29` tasks empty (`27/29` usable), breaks Excel parsers (`parse_ok=False`), crashes IFC4 scripts (`ERR_EXEC`), collapses on 353-tool MCP portals, and thrashes under `50k` compaction.
 
-`ple-harness` v3.0 ([`serve.py`](serve.py) + [`harness.py`](harness.py)) eliminates empty exports (**`29/29` usable**) and all parse/script crashes, fixes Cluster-A blind-MCP collapse (`0.015 -> 0.118`), and lifts `google-cloud/gemini-3.8-flash` on `PROBE3` from **`0.000` (`0/3`) to `0.153` (`3/3`)**. On our targeted 5-task A/B slice, removing v2.1's non-MCP-turn write blocking, adding LibreOffice formula recalculation, tightening IFC4/XLSX cold-read audits, and inserting a fresh-context PE reviewer lifted `gpt-oss-120b` **`+69.1%` relative to v2.1 (`0.042 -> 0.070`)**, bringing the 29-task artifact snapshot to **`0.046` (`$0.075/task`, `1.70 min/task`, `29/29` usable)**. For Stage 2, [`submission.yaml`](submission.yaml) upgrades to **`google-cloud/gemini-4-neon`** (`high`, `220k` compaction, `16k` output, `300s` verify reserve, vision enabled, independent PE reviewer enabled, uncapped calls/USD); as disclosed below, the committed [`artifacts/`](artifacts/manifest.json) bundle was generated locally on `gpt-oss-120b` (`deepseek/deepseek-v4.1-flash` judge) prior to switching `model_api` to `gemini-4-neon`.
+`ple-harness` v3.0 ([`serve.py`](serve.py) + [`harness.py`](harness.py)) eliminates empty exports (**`29/29` usable**) and all parse/script crashes, fixes Cluster-A blind-MCP collapse (`0.015 -> 0.118`), and lifts `google-cloud/gemini-3.8-flash` on `PROBE3` from **`0.000` (`0/3`) to `0.153` (`3/3`)**. On our targeted 5-task A/B slice, removing v2.1's non-MCP-turn write blocking, adding LibreOffice formula recalculation, tightening IFC4/XLSX cold-read audits, and inserting a fresh-context PE reviewer lifted `gpt-oss-120b` **`+69.1%` relative to v2.1 (`0.042 -> 0.070`)**, bringing the 29-task artifact snapshot to **`0.046` (`$0.075/task`, `1.70 min/task`, `29/29` usable)**. For Stage 2, [`submission.yaml`](submission.yaml) upgrades to **`google-cloud/gemini-4-neon`** (`high`, `220k` compaction, `32k` output, `300s` verify reserve, vision enabled, independent PE reviewer enabled, uncapped calls/USD); as disclosed below, the committed [`artifacts/`](artifacts/manifest.json) bundle was generated locally on `gpt-oss-120b` (`deepseek/deepseek-v4.1-flash` judge) prior to switching `model_api` to `gemini-4-neon`.
 
 ---
 
@@ -19,7 +19,7 @@ Most agent harnesses treat engineering failures as model reasoning deficits—as
 ```mermaid
 flowchart LR
     EVAL["Evaluator / taskbridge v1<br/>(WebSocket /eval, 6h limit)"] --> RECON["Turn-0 Workspace Recon<br/>(Files, XLSX Templates, Solvers)"]
-    RECON --> LOOP["Coordinator Loop (gemini-4-neon)<br/>(220k Compact, 16k Out, High Effort,<br/>read_image + 400 fallback)"]
+    RECON --> LOOP["Coordinator Loop (gemini-4-neon)<br/>(220k Compact, 32k Out, High Effort,<br/>read_image + 400 fallback)"]
     LOOP <-->|"HTTPS_PROXY<br/>(400 / Retry / effort / merged)"| LLM["Model Endpoint<br/>(google-cloud/gemini-4-neon)"]
     LOOP -->|"<=8 tools: Direct<br/>>8 tools: service_groups() + search"| MCP["MCPCatalog<br/>(One-Shot Nudge + Same-Turn Defer)"]
     LOOP --> TOOLS["Container Tools<br/>(bash, file I/O, EvidenceLedger,<br/>LibreOffice XLSX recalc, SciPy/ezdxf/ifcopenshell)"]
@@ -43,7 +43,7 @@ flowchart LR
 | **Unit flips & revision conflicts** | `EvidenceLedger` normalizes `19` physical dimensions to SI (`tr`, `btuh`, `mbh`, `in_wg`, `ft_h2o`, `klf`, `pcf`, `kcmil`, `c*cm/w`, etc.) and gates unresolved `supersedes` conflicts | [`evidence.py`](evidence.py): `EvidenceLedger`, `UNIT_TABLE`, `normalize_unit`, `convert_unit` |
 | **Broken templates, IFC4, DXF, PDF & memos** | Cold-read auditing plus LibreOffice `.xlsx` formula evaluation (`_recalc_workbook_if_needed`), IFC4 `missing_representation_contexts` & `missing_spatial_structure`, per-cell `excel_formula_error`, and `blank_template_sheet` checks (`MAX_VERIFY_REPAIRS="2"`) | [`harness.py`](harness.py): `_recalc_workbook_if_needed`; [`verifiers/`](verifiers/__init__.py): `audit_workbook_bytes`, `audit_ifc4_bytes`, `audit_dxf_bytes`, `audit_pdf_bytes`, `audit_decision_memo` |
 | **Unreviewed stubs & blind image docs** | Fresh-context read-only PE reviewer (`_run_independent_review`, `<=2` rounds, `<=12` calls) before final pass, plus `read_image` visual tool with automatic `drop_image_input()` fallback on endpoints rejecting image parts | [`harness.py`](harness.py): `_run_independent_review`, `drop_image_input`, `ENABLE_IMAGE_INPUT` |
-| **50k thrashing, timeout & API errors** | Model-aware compaction (`220k` on 1M-context Gemini 4 Neon / `90k` otherwise) retaining `12` recent outputs, `20 MiB` incumbent rollback, `RESERVE_VERIFY_SEC="300"`, `CancelledError` `_last_durable_summary` rescue, empty-string `merged()` thought-signature guard, and `400` recovery (`drop_effort`, `drop_stream_options`) | [`harness.py`](harness.py): `compact_at`, `compact`, `finish`, `_snapshot_incumbent`, `merged`, `marked`, `drop_thinking`, `drop_effort`, `drop_stream_options`; [`pricing.py`](pricing.py): `UsageTracker`, `LOCKED_RATES` |
+| **50k thrashing, timeout & API errors** | Model-aware compaction (`220k` on 1M-context Gemini 4 Neon / `90k` otherwise) retaining `12` recent outputs, `20 MiB` incumbent rollback, `RESERVE_VERIFY_SEC="300"`, `CancelledError` `_last_durable_summary` rescue, empty-string `merged()` thought-signature guard, and `400`/`402` recovery (`drop_effort`, `drop_stream_options`, `shrink_output`) | [`harness.py`](harness.py): `compact_at`, `compact`, `finish`, `_snapshot_incumbent`, `merged`, `marked`, `drop_thinking`, `drop_effort`, `drop_stream_options`, `shrink_output`; [`pricing.py`](pricing.py): `UsageTracker`, `LOCKED_RATES` |
 
 ---
 
@@ -102,11 +102,11 @@ Prompt caching (`82–94%` across `PROBE3`; `89.6%` on 29-task v3.0 artifacts) a
 
 ## Verified Checks & Reproducibility
 
-### Automated Tests (`40 passed, 0 failed`)
+### Automated Tests (`41 passed, 0 failed`)
 
 ```bash
 uv run --with pytest --with-requirements requirements.txt python -m pytest -q
-# -> 40 passed, 7 warnings (upstream ezdxf PyparsingDeprecationWarning)
+# -> 41 passed, 7 warnings (upstream ezdxf PyparsingDeprecationWarning)
 ```
 
 | Test Module | Tests | Coverage |
@@ -116,7 +116,7 @@ uv run --with pytest --with-requirements requirements.txt python -m pytest -q
 | [`tests/test_geometry_ifc_synthetic.py`](tests/test_geometry_ifc_synthetic.py) | `4` | 2D viewport similarity, STEP IFC4 cross/self clashes, forbidden zones, translation invariance, `RepresentationContexts` & spatial hierarchy |
 | [`tests/test_mcp_efficiency_synthetic.py`](tests/test_mcp_efficiency_synthetic.py) | `2` | 264-tool HTTP MCP benchmark (`62,370 -> 449 tok/req`, `-99.28%`, `264/264` reachable) & `<=8` direct routing |
 | [`tests/test_mv_workbook_synthetic.py`](tests/test_mv_workbook_synthetic.py) | `8` | Workbook & ZIP audit, circular reference detection, formula evaluation, per-cell formula error coords, blank template sheet detection, incumbent rollback, `EvidenceLedger` SI conversions |
-| [`tests/test_protocol_e2e.py`](tests/test_protocol_e2e.py) | `18` | Live `serve.py` WebSocket loop: `429`/`500` retries, `400` fallbacks, budget cap, `cancel`, one-shot MCP nudges, fresh-context PE reviewer, `drop_image_input` 400 fallback, recon, `service_groups` |
+| [`tests/test_protocol_e2e.py`](tests/test_protocol_e2e.py) | `19` | Live `serve.py` WebSocket loop: `429`/`500` retries, `400`/`402` fallbacks, budget cap, `cancel`, one-shot MCP nudges, fresh-context PE reviewer, `drop_image_input` 400 fallback, recon, `service_groups` |
 
 ### Competition Kit Validation & OpenRouter Local Proxy
 
@@ -152,14 +152,14 @@ uv run python eval/run.py ../ple-harness --env-file openrouter.env
 - [`pricing.py`](pricing.py) — Locked Kaggle Stage-2 model pricing (`LOCKED_RATES`, `#761530`) and `UsageTracker`.
 - [`taskbridge.py`](taskbridge.py) — Upstream `google-research/ple` WebSocket/MCP protocol relay (`Apache-2.0`).
 - [`artifacts/`](artifacts/manifest.json) — Unpacked 29-task dev deliverables (`29/29` usable, generated locally on `gpt-oss-120b`).
-- [`tests/`](tests/) — `40` synthetic and live WebSocket E2E tests.
+- [`tests/`](tests/) — `41` synthetic and live WebSocket E2E tests.
 
 ### `submission.yaml` `env` Settings (Stage-2 v3.0 Defaults)
 
 | Variable | Value | Effect |
 |---|---:|---|
 | `COMPACT_AT_TOKENS` | `"220000"` | Context threshold triggering trimming & `SUMMARY_PROMPT` compaction (`220k` on 1M-context models; `90k` otherwise) |
-| `MAX_OUTPUT_TOKENS` | `"16384"` | Max completion tokens per LLM call (auto-shrunk on `400` context errors) |
+| `MAX_OUTPUT_TOKENS` | `"32000"` | Max completion tokens per LLM call (auto-shrunk via `shrink_output` on `400`/`402` limits) |
 | `MAX_MODEL_CALLS` | `"0"` | Uncapped model calls inside the 6-hour Stage-2 container (`"0"` = unlimited) |
 | `REASONING_EFFORT` | `"high"` | Frontier reasoning level (auto-stepped down or dropped on `400`) |
 | `RESERVE_VERIFY_SEC` | `"300"` | Wall-clock margin reserved before timeout for audit, PE review & `finish()` |
